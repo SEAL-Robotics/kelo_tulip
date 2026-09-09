@@ -283,6 +283,7 @@ void PlatformDriverROS::readWheelConfig() {
 		nh->declare_parameter(groupName + ".x", 0.0);
 		nh->declare_parameter(groupName + ".y", 0.0);
 		nh->declare_parameter(groupName + ".a", 0.0);
+		nh->declare_parameter(groupName + ".model", "KD100");
 
 		kelo::WheelConfig config;
 		config.enable = true;
@@ -628,6 +629,7 @@ void PlatformDriverROS::publishProcessDataInput() {
 	for (int i = 0; i < nWheels; i++) {
 		txpdo1_t* swData = driver->getWheelProcessData(i);
 		kelo_tulip::msg::KeloDriveInput wheel;
+		wheel.ddata = swData->ddata;
 		wheel.status1 = swData->status1;
 		wheel.status2 = swData->status2;
 		wheel.sensor_ts = swData->sensor_ts;
