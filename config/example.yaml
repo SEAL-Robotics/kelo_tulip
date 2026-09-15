@@ -1,53 +1,53 @@
 /**:
   ros__parameters:
     num_wheels: 4
-    device: eno1
-
-    #vlin_max: 1.2  # m / s
-    #va_max: 1.1  # rad / s
-    #vlin_acc_max: 0.4  # m / s^2
-    #vlin_dec_max: 1.0  # m / s^2
-    #va_acc_max: 0.5  # rad / s^2
-    #va_dec_max: 1.0  # rad / s^2
+    device: enp1s0
+    vlin_max: 0.5
+    va_max: 0.25
+    vlin_acc_max: 0.15
+    vlin_dec_max: 0.5
+    va_acc_max: 0.15
+    va_dec_max: 0.5
 
     wheel_models:
-      KD108:
-        diameter: 0.107
-        width: 0.04
-        casteroffset: 0.01
-        wheeldistance: 0.11
+      list: ["KD165"]
+      KD165:
+        diameter: 0.165
+        width: 0.06
+        casteroffset: 0.015
+        wheeldistance: 0.184
         velocitylimit: 100.0
         currentlimit: 1.0
         standbycurrent: 0.1
         canPivot: true
 
     wheel0:
-      model: KD108
-      ethercat_number: 3
-      x: 0.233
-      y: 0.1165
-      a: 1.57
+      model: KD165
+      ethercat_number: 1
+      x: 1.0325
+      y: -0.2425
+      a: 1.5708
 
     wheel1:
-      model: KD108
-      ethercat_number: 5
-      x: -0.233
-      y: 0.1165
-      a: 1.57
+      model: KD165
+      ethercat_number: 2
+      x: 1.0325
+      y: 0.2425
+      a: -1.5708
 
     wheel2:
-      model: KD108
-      ethercat_number: 7
-      x: -0.233
-      y: -0.1165
-      a: 1.57
+      model: KD165
+      ethercat_number: 3
+      x: -1.0325
+      y: 0.2425
+      a: -1.5708
 
     wheel3:
-      model: KD108
-      ethercat_number: 9
-      x: 0.233
-      y: -0.1165
-      a: 1.57
+      model: KD165
+      ethercat_number: 4
+      x: -1.0325
+      y: -0.2425
+      a: 1.5708
 
 platform_driver:
   ros__parameters:
