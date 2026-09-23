@@ -147,14 +147,12 @@ protected:
 
 	int nWheels;
 
-	bool useJoy;
 	bool debugMode;
 	bool activeByJoypad;
 
-	double joyVlinMax;
-	double joyVaMax;
-	double joyScale;
-	std::vector<float> prev_axes;
+	bool publishTf;
+	std::string odomFrame;
+	std::string baseFrame;
 
 	std::vector<double> prev_left_enc;
 	std::vector<double> prev_right_enc;
