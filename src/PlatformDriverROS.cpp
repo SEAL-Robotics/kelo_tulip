@@ -167,7 +167,7 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	errorPublisher = nh->create_publisher<std_msgs::msg::Int32>("~/error", 10);
 	statusPublisher = nh->create_publisher<std_msgs::msg::Int32>("~/status", 10);
 	joySubscriber = nh->create_subscription<sensor_msgs::msg::Joy>("/joy", 5, std::bind(&PlatformDriverROS::joyCallback, this, std::placeholders::_1));
-	cmdVelSubscriber = nh->create_subscription<geometry_msgs::msg::Twist>("/cmd_vel", 5, std::bind(&PlatformDriverROS::cmdVelCallback, this, std::placeholders::_1));
+	cmdVelSubscriber = nh->create_subscription<geometry_msgs::msg::Twist>("/cmd_vel", 1, std::bind(&PlatformDriverROS::cmdVelCallback, this, std::placeholders::_1));
 	resetSubscriber = nh->create_subscription<std_msgs::msg::Empty>("reset", 1, std::bind(&PlatformDriverROS::resetCallback, this, std::placeholders::_1));
 	enableSubscriber = nh->create_subscription<std_msgs::msg::Int32MultiArray>("wheels_enable", 10, std::bind(&PlatformDriverROS::enableCallback, this, std::placeholders::_1));
 	

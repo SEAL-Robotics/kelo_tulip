@@ -36,6 +36,10 @@ public:
 
 	using kelo::PlatformDriverROS::cmdVelCallback;
 
+	rclcpp::QoS cmdVelQos() {
+		return cmdVelSubscriber->get_actual_qos();
+	}
+
 protected:
 	kelo::PlatformDriver* createDriver() override {
 		return new RecordingPlatformDriver(wheelConfigs, wheelData);
@@ -71,6 +75,11 @@ protected:
 
 TEST_F(PlatformDriverROSWatchdog, readsTimeoutParameter) {
 	EXPECT_DOUBLE_EQ(node->get_parameter("cmd_vel_timeout").as_double(), 0.05);
+}
+
+TEST_F(PlatformDriverROSWatchdog, cmdVelKeepsOnlyLatestMessage) {
+	// A queued backlog would replay old commands after a stall.
+	EXPECT_EQ(driverRos.cmdVelQos().depth(), 1u);
 }
 
 TEST_F(PlatformDriverROSWatchdog, freshCommandIsPassedThrough) {
