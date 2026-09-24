@@ -211,4 +211,9 @@ ament_export_dependencies(Boost)
 ament_export_dependencies(std_msgs)
 ament_export_libraries(tulip_library tulip_velocity_controller soem)
 
+if(BUILD_TESTING)
+	find_package(ament_cmake_gtest REQUIRED)
+	ament_add_gtest(test_command_watchdog test/test_command_watchdog.cpp)
+endif()
+
 ament_package()
