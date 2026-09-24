@@ -52,14 +52,15 @@ PlatformDriverROS::PlatformDriverROS()
 {
 	nWheels = 0;
 
-	useJoy = false;
 	debugMode = false;
 	activeByJoypad = false;
 
-	joyVlinMax = 1.0;
-	joyVaMax = 1.0;
-	joyScale = 1.0;
-	prev_axes.resize(6, 0.0);
+	// The Jetson's state estimator owns odom -> base_footprint in production,
+	// so this driver must not publish odom TF unless explicitly asked to
+	// (bench testing, or running this driver standalone off the pod).
+	publishTf = false;
+	odomFrame = "odom";
+	baseFrame = "base_footprint";
 
 	odomx = 0;
 	odomy = 0;
@@ -86,10 +87,11 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	nh->declare_parameter("va_acc_max", 0.5); 
 	nh->declare_parameter("va_dec_max", 0.8);
 	nh->declare_parameter("angle_acc_max", 0.8);
-	nh->declare_parameter("joy_vlin_max", 1.0); 
-	nh->declare_parameter("joy_va_max", 1.0); 
-	nh->declare_parameter("joy_scale", 1.0);
 	nh->declare_parameter("active_by_joypad", false);
+	nh->declare_parameter("odom_frame", odomFrame);
+	nh->declare_parameter("base_frame", baseFrame);
+	nh->declare_parameter("publish_tf", publishTf);
+	nh->declare_parameter("cmd_vel_timeout", cmdVelWatchdog.getTimeout());
 
 	rclcpp::Parameter num_wheels;
 	if (!nh->get_parameter("num_wheels", num_wheels)) {
@@ -133,22 +135,28 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	if (nh->get_parameter("va_dec_max", x))
 		driver->setMaxvadec(x.as_double());
 
-	joyVlinMax = driver->getMaxvlin();
-	joyVaMax = driver->getMaxva();
-	if (nh->get_parameter("joy_vlin_max", x))
-		joyVlinMax = x.as_double();
-	if (nh->get_parameter("joy_va_max", x))
-		joyVaMax = x.as_double();
-	if (nh->get_parameter("joy_scale", x))
-		if (x.as_double() > 0 && x.as_double() <= 1.0)
-			joyScale = x.as_double();
-
 	rclcpp::Parameter b;
 	if (nh->get_parameter("active_by_joypad", b))
 		activeByJoypad = b.as_bool();
 	if (!activeByJoypad)
 		driver->setCanChangeActive();
-		
+
+	rclcpp::Parameter frameParam;
+	if (nh->get_parameter("odom_frame", frameParam))
+		odomFrame = frameParam.as_string();
+	if (nh->get_parameter("base_frame", frameParam))
+		baseFrame = frameParam.as_string();
+	rclcpp::Parameter publishTfParam;
+	if (nh->get_parameter("publish_tf", publishTfParam))
+		publishTf = publishTfParam.as_bool();
+
+	// If the /cmd_vel publisher dies or stalls, the last command would
+	// otherwise be held forever. There is deliberately no way to disable this.
+	double cmdVelTimeout = nh->get_parameter("cmd_vel_timeout").as_double();
+	if (!cmdVelWatchdog.setTimeout(cmdVelTimeout))
+		RCLCPP_ERROR(nh->get_logger(), "cmd_vel_timeout %f s is outside (0, %.1f], using %.3f s",
+			cmdVelTimeout, CommandWatchdog::MAX_TIMEOUT_SEC, cmdVelWatchdog.getTimeout());
+
 	odomPublisher = nh->create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
 	odomInitializedPublisher = nh->create_publisher<std_msgs::msg::Empty>("/odom_initialized", 10);
 //	timestampPublisher = nh->create_publisher<std_msgs::msg::UInt64MultiArray>("timestamp", 10);
@@ -158,7 +166,7 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	errorPublisher = nh->create_publisher<std_msgs::msg::Int32>("~/error", 10);
 	statusPublisher = nh->create_publisher<std_msgs::msg::Int32>("~/status", 10);
 	joySubscriber = nh->create_subscription<sensor_msgs::msg::Joy>("/joy", 5, std::bind(&PlatformDriverROS::joyCallback, this, std::placeholders::_1));
-	cmdVelSubscriber = nh->create_subscription<geometry_msgs::msg::Twist>("/cmd_vel", 5, std::bind(&PlatformDriverROS::cmdVelCallback, this, std::placeholders::_1));
+	cmdVelSubscriber = nh->create_subscription<geometry_msgs::msg::Twist>("/cmd_vel", 1, std::bind(&PlatformDriverROS::cmdVelCallback, this, std::placeholders::_1));
 	resetSubscriber = nh->create_subscription<std_msgs::msg::Empty>("reset", 1, std::bind(&PlatformDriverROS::resetCallback, this, std::placeholders::_1));
 	enableSubscriber = nh->create_subscription<std_msgs::msg::Int32MultiArray>("wheels_enable", 10, std::bind(&PlatformDriverROS::enableCallback, this, std::placeholders::_1));
 	
@@ -170,6 +178,14 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 }
 
 bool PlatformDriverROS::step() {
+	// Stop when /cmd_vel goes silent; the controller then ramps down with
+	// vlin_dec_max/va_dec_max. Checked at the ROS loop rate, so the reaction
+	// time is cmd_vel_timeout plus up to one loop period.
+	if (cmdVelWatchdog.checkExpired(CommandWatchdog::Clock::now())) {
+		driver->setTargetVelocity(0, 0, 0);
+		RCLCPP_WARN(nh->get_logger(), "No /cmd_vel for %.3f s, commanding zero velocity", cmdVelWatchdog.getTimeout());
+	}
+
 	checkAndPublishSmartWheelStatus();
 
 	//calculate robot velocity
@@ -185,11 +201,15 @@ bool PlatformDriverROS::step() {
 	//publish the odometry
 	publishOdometry(vx, vy, va);
 
-	//broadcast odom-base_link transform
-	geometry_msgs::msg::TransformStamped odom_trans;
-	createOdomToBaseLinkTransform(odom_trans);
-	odom_broadcaster->sendTransform(odom_trans);
-	
+	// publish_tf defaults false: on the pod, the Jetson's state estimator owns
+	// odom -> base_footprint, so this driver must not publish odom TF in
+	// production. Enable it only for bench testing or standalone use.
+	if (publishTf) {
+		geometry_msgs::msg::TransformStamped odom_trans;
+		createOdomToBaseLinkTransform(odom_trans);
+		odom_broadcaster->sendTransform(odom_trans);
+	}
+
 /*
 		//publish smartwheel values
 		std_msgs::msg::float64_multi_array processDataValues;
@@ -586,8 +606,8 @@ void PlatformDriverROS::publishOdometry(double vx, double vy, double va) {
 	nav_msgs::msg::Odometry odom;
 	odom.header.stamp = nh->get_clock()->now();
 	//odom.header.seq = sequence_id++;
-	odom.header.frame_id = "odom";
-	odom.child_frame_id = "base_link";
+	odom.header.frame_id = odomFrame;
+	odom.child_frame_id = baseFrame;
 	odom.pose.covariance[0] = 1e-3;
 	odom.pose.covariance[7] = 1e-3;
 	odom.pose.covariance[8] = 0.0;
@@ -616,8 +636,8 @@ void PlatformDriverROS::createOdomToBaseLinkTransform(geometry_msgs::msg::Transf
 	tf2::Quaternion odom_quat;
 	odom_quat.setRPY(0, 0, odoma);
 	odom_trans.header.stamp = nh->get_clock()->now();
-	odom_trans.header.frame_id = "odom";
-	odom_trans.child_frame_id = "base_link";
+	odom_trans.header.frame_id = odomFrame;
+	odom_trans.child_frame_id = baseFrame;
 	odom_trans.transform.translation.x = odomx;
 	odom_trans.transform.translation.y = odomy;
 	odom_trans.transform.translation.z = 0.0;
@@ -707,44 +727,29 @@ void PlatformDriverROS::joyCallback(const sensor_msgs::msg::Joy::SharedPtr joy) 
 	joyCallbackImpl(joy);
 }
 
+// cmd_vel is the only velocity input this driver accepts; a velocity_guard
+// node (or equivalent arbiter) is the sole publisher of that topic and is
+// responsible for arbitrating manual/joypad input against autonomous
+// commands, obstacle and fault latches. This driver must never read the
+// joypad to drive the wheels directly -- doing so let a held deadman button
+// bypass the arbiter's clamp, ramp and latches entirely. The only legitimate
+// use of /joy left here is the activeByJoypad startup gate below, which only
+// ever flips a one-time READY-to-ACTIVE latch and never sets a velocity.
 void PlatformDriverROS::joyCallbackImpl(const sensor_msgs::msg::Joy::SharedPtr joy) {
-	if (joy->buttons[5]) {
-		useJoy = true;
+	if (!activeByJoypad)
+		return;
 
-		if (prev_axes[5] <= 0 && joy->axes[5] > 0.5 && joyScale < 1.0) {
-			joyScale = joyScale * 2.0;
-			if (joyScale > 1.0)
-				joyScale = 1.0;
-			std::cout << "New joypad maxvel = " << joyScale * joyVlinMax << " m/s" << std::endl;
-		} else if (prev_axes[5] >= 0 && joy->axes[5] < -0.5 && joyScale > 0.001) {
-			joyScale = joyScale / 2.0;
-			std::cout << "New joypad maxvel = " << joyScale * joyVlinMax << " m/s" << std::endl;
-		}
-
-	} else {
-		if (useJoy)
-			driver->setTargetVelocity(0, 0, 0);
-
-		useJoy = false;
-	}
-
-	if (useJoy) {
-		driver->setTargetVelocity(joy->axes[1] * joyVlinMax * joyScale, joy->axes[0] * joyVlinMax * joyScale, joy->axes[2] * joyVaMax * joyScale);
-		if (activeByJoypad)
-			driver->setCanChangeActive();
-	}
-
-	if (prev_axes.size() == joy->axes.size()) {
-		prev_axes = joy->axes;
-	} else {
-		std::cout << "Joypad axes dimension does not match. Please check the joypad configuration!" << std::endl;
-	}
+	// Matches the deadman button convention used by the velocity arbiter
+	// (button 5 / R1). Bounds-checked: a joypad reporting fewer buttons than
+	// expected must not read out of range on this safety-critical host.
+	const size_t deadmanButton = 5;
+	if (deadmanButton < joy->buttons.size() && joy->buttons[deadmanButton])
+		driver->setCanChangeActive();
 }
 
-void PlatformDriverROS::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg) const {
-	//if (!useJoy && !debugMode)
-	if (!useJoy)
-		driver->setTargetVelocity(msg->linear.x, msg->linear.y, msg->angular.z);
+void PlatformDriverROS::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg) {
+	cmdVelWatchdog.kick(CommandWatchdog::Clock::now());
+	driver->setTargetVelocity(msg->linear.x, msg->linear.y, msg->angular.z);
 }
 
 void PlatformDriverROS::resetCallback(const std_msgs::msg::Empty::SharedPtr msg) const {

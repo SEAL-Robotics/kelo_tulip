@@ -186,11 +186,45 @@ bool EtherCATMaster::initEthercat() {
 	attrs.set_stack_size(4096*32);
 	pthread_attr_getschedparam(attrs.native_handle(), &param);
 	param.sched_priority = 40;
+	// Without PTHREAD_EXPLICIT_SCHED the thread inherits the creator's policy
+	// (SCHED_OTHER) and the policy and priority below are silently ignored.
+	pthread_attr_setinheritsched(attrs.native_handle(), PTHREAD_EXPLICIT_SCHED);
     pthread_attr_setschedpolicy(attrs.native_handle(), SCHED_FIFO);
 	pthread_attr_setschedparam (attrs.native_handle(), &param);
 
- 	ethercatThread = new boost::thread(attrs, boost::bind(&EtherCATMaster::ethercatHandler, this));
-// 	ethercatThread = new boost::thread(boost::bind(&EtherCATMaster::ethercatHandler, this));
+	ethercatThread = NULL;
+	try {
+		ethercatThread = new boost::thread(attrs, boost::bind(&EtherCATMaster::ethercatHandler, this));
+	} catch (const boost::thread_resource_error& e) {
+		// Setting a real-time policy needs CAP_SYS_NICE (or an RLIMIT_RTPRIO
+		// allowance); without it thread creation fails with EPERM.
+		std::cerr << "WARNING: Could not start EtherCAT thread with SCHED_FIFO (" << e.what()
+			<< "), falling back to default scheduling. Grant cap_sys_nice to fix." << std::endl;
+		try {
+			ethercatThread = new boost::thread(boost::bind(&EtherCATMaster::ethercatHandler, this));
+		} catch (const boost::thread_resource_error& e2) {
+			std::cerr << "Could not start EtherCAT thread (" << e2.what() << ")." << std::endl;
+		}
+	}
+
+	if (!ethercatThread) {
+		stopThread = true;
+		ethercatCheckThread->join();
+		delete ethercatCheckThread;
+		ethercatCheckThread = NULL;
+		closeEthercat();
+		stopThread = false;
+		return false;
+	}
+
+	int policy;
+	sched_param actual;
+	if (pthread_getschedparam(ethercatThread->native_handle(), &policy, &actual) == 0) {
+		if (policy == SCHED_FIFO)
+			std::cout << "EtherCAT thread scheduling: SCHED_FIFO, priority " << actual.sched_priority << std::endl;
+		else
+			std::cerr << "WARNING: EtherCAT thread is not running with SCHED_FIFO, cycle timing is not real-time." << std::endl;
+	}
 	sleep(1);
 	inOP = true;
 
