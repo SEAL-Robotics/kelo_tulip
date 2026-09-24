@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "kelo_tulip/CommandWatchdog.h"
 
 using kelo::CommandWatchdog;
@@ -64,6 +66,24 @@ TEST(CommandWatchdog, timeoutIsConfigurable) {
 	watchdog.kick(t0);
 	EXPECT_FALSE(watchdog.checkExpired(t0 + milliseconds(400)));
 	EXPECT_TRUE(watchdog.checkExpired(t0 + milliseconds(501)));
+}
+
+TEST(CommandWatchdog, rejectsTimeoutsOutsideValidRange) {
+	CommandWatchdog watchdog(0.2);
+	const double invalid[] = {0.0, -0.1, 2.001, 200.0,
+		std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()};
+
+	for (double timeout : invalid) {
+		EXPECT_FALSE(watchdog.setTimeout(timeout)) << timeout;
+		EXPECT_DOUBLE_EQ(watchdog.getTimeout(), 0.2) << timeout;
+	}
+}
+
+TEST(CommandWatchdog, acceptsMaximumTimeout) {
+	CommandWatchdog watchdog(0.2);
+
+	EXPECT_TRUE(watchdog.setTimeout(CommandWatchdog::MAX_TIMEOUT_SEC));
+	EXPECT_DOUBLE_EQ(watchdog.getTimeout(), CommandWatchdog::MAX_TIMEOUT_SEC);
 }
 
 } // namespace

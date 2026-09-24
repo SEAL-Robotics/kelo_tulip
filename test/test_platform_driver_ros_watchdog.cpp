@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -35,6 +36,10 @@ public:
 	}
 
 	using kelo::PlatformDriverROS::cmdVelCallback;
+
+	double cmdVelTimeout() const {
+		return cmdVelWatchdog.getTimeout();
+	}
 
 	rclcpp::QoS cmdVelQos() {
 		return cmdVelSubscriber->get_actual_qos();
@@ -74,7 +79,7 @@ protected:
 };
 
 TEST_F(PlatformDriverROSWatchdog, readsTimeoutParameter) {
-	EXPECT_DOUBLE_EQ(node->get_parameter("cmd_vel_timeout").as_double(), 0.05);
+	EXPECT_DOUBLE_EQ(driverRos.cmdVelTimeout(), 0.05);
 }
 
 TEST_F(PlatformDriverROSWatchdog, cmdVelKeepsOnlyLatestMessage) {
@@ -111,5 +116,31 @@ TEST_F(PlatformDriverROSWatchdog, noZeroBeforeFirstCommand) {
 
 	EXPECT_TRUE(driverRos.recorder()->targets.empty());
 }
+
+// A mistyped timeout (e.g. milliseconds) must not turn into minutes of
+// stale travel: invalid values fall back to the 0.2 s default.
+class PlatformDriverROSInvalidTimeout : public ::testing::TestWithParam<double> {
+protected:
+	static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
+	static void TearDownTestSuite() { rclcpp::shutdown(); }
+};
+
+TEST_P(PlatformDriverROSInvalidTimeout, fallsBackToDefault) {
+	rclcpp::NodeOptions options;
+	options.parameter_overrides({
+		rclcpp::Parameter("num_wheels", 0),
+		rclcpp::Parameter("cmd_vel_timeout", GetParam()),
+	});
+	auto node = std::make_shared<rclcpp::Node>("platform_driver_invalid_timeout_test", options);
+	TestablePlatformDriverROS driverRos;
+	ASSERT_TRUE(driverRos.init(node, ""));
+
+	EXPECT_DOUBLE_EQ(driverRos.cmdVelTimeout(), 0.2);
+}
+
+INSTANTIATE_TEST_SUITE_P(InvalidValues, PlatformDriverROSInvalidTimeout, ::testing::Values(
+	200.0, 0.0, -0.1,
+	std::numeric_limits<double>::infinity(),
+	std::numeric_limits<double>::quiet_NaN()));
 
 } // namespace

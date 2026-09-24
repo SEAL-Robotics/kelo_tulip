@@ -7,6 +7,7 @@
 #define KELOTULIP_COMMANDWATCHDOG_H
 
 #include <chrono>
+#include <cmath>
 
 namespace kelo {
 
@@ -17,15 +18,31 @@ class CommandWatchdog {
 public:
 	typedef std::chrono::steady_clock Clock;
 
-	explicit CommandWatchdog(double timeoutSec = 0.2)
-		: timeout(toDuration(timeoutSec))
+	static constexpr double DEFAULT_TIMEOUT_SEC = 0.2;
+	//! Upper bound so a mistyped value (e.g. milliseconds) cannot turn into
+	//! minutes of travel on a stale command.
+	static constexpr double MAX_TIMEOUT_SEC = 2.0;
+
+	explicit CommandWatchdog(double timeoutSec = DEFAULT_TIMEOUT_SEC)
+		: timeout(toDuration(DEFAULT_TIMEOUT_SEC))
 		, lastCommand()
 		, armed(false)
 	{
+		setTimeout(timeoutSec);
 	}
 
-	void setTimeout(double timeoutSec) {
+	static bool isValidTimeout(double timeoutSec) {
+		return std::isfinite(timeoutSec) && timeoutSec > 0 && timeoutSec <= MAX_TIMEOUT_SEC;
+	}
+
+	//! Returns false and keeps the current timeout if timeoutSec is not in
+	//! (0, MAX_TIMEOUT_SEC]; the watchdog cannot be disabled.
+	bool setTimeout(double timeoutSec) {
+		if (!isValidTimeout(timeoutSec))
+			return false;
+
 		timeout = toDuration(timeoutSec);
+		return true;
 	}
 
 	double getTimeout() const {

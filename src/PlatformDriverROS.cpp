@@ -153,10 +153,9 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	// If the /cmd_vel publisher dies or stalls, the last command would
 	// otherwise be held forever. There is deliberately no way to disable this.
 	double cmdVelTimeout = nh->get_parameter("cmd_vel_timeout").as_double();
-	if (cmdVelTimeout > 0)
-		cmdVelWatchdog.setTimeout(cmdVelTimeout);
-	else
-		RCLCPP_ERROR(nh->get_logger(), "cmd_vel_timeout must be > 0, using %.3f s", cmdVelWatchdog.getTimeout());
+	if (!cmdVelWatchdog.setTimeout(cmdVelTimeout))
+		RCLCPP_ERROR(nh->get_logger(), "cmd_vel_timeout %f s is outside (0, %.1f], using %.3f s",
+			cmdVelTimeout, CommandWatchdog::MAX_TIMEOUT_SEC, cmdVelWatchdog.getTimeout());
 
 	odomPublisher = nh->create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
 	odomInitializedPublisher = nh->create_publisher<std_msgs::msg::Empty>("/odom_initialized", 10);
