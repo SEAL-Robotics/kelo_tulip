@@ -125,6 +125,8 @@ Currently the kelo_tulip software uses ROS as a middleware, subscribing resp. pu
 
 This topic accepts [`geometry_msgs/Twist`](https://docs.ros2.org/foxy/api/geometry_msgs/msg/Twist.html) messages. Any motion software that creates a velocity vector for the platform and publishes `geometry_msgs/Twist` messages to the `cmd_vel` topic can be used. The ROS package [`Nav2`](https://github.com/ros-navigation/navigation2) is an example that conforms to that.
 
+Commands must keep arriving: if no message is received for `cmd_vel_timeout` seconds (parameter, default 0.2), the target velocity is set to zero and the platform ramps down with its configured deceleration limits. Publish at a rate well above `1 / cmd_vel_timeout`.
+
 #### /joy
 
 By sending messages to the `/joy` topic the platform can be moved by a joypad. The [`joy` ROS package](http://wiki.ros.org/joy) can be used to send these messages via joypad. In the function `joyCallback()` in `PlatformDriverROS.cpp` is a simple translation between joystick input and platform velocity command.

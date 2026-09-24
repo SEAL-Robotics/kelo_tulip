@@ -91,6 +91,7 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	nh->declare_parameter("odom_frame", odomFrame);
 	nh->declare_parameter("base_frame", baseFrame);
 	nh->declare_parameter("publish_tf", publishTf);
+	nh->declare_parameter("cmd_vel_timeout", cmdVelWatchdog.getTimeout());
 
 	rclcpp::Parameter num_wheels;
 	if (!nh->get_parameter("num_wheels", num_wheels)) {
@@ -149,6 +150,14 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	if (nh->get_parameter("publish_tf", publishTfParam))
 		publishTf = publishTfParam.as_bool();
 
+	// If the /cmd_vel publisher dies or stalls, the last command would
+	// otherwise be held forever. There is deliberately no way to disable this.
+	double cmdVelTimeout = nh->get_parameter("cmd_vel_timeout").as_double();
+	if (cmdVelTimeout > 0)
+		cmdVelWatchdog.setTimeout(cmdVelTimeout);
+	else
+		RCLCPP_ERROR(nh->get_logger(), "cmd_vel_timeout must be > 0, using %.3f s", cmdVelWatchdog.getTimeout());
+
 	odomPublisher = nh->create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
 	odomInitializedPublisher = nh->create_publisher<std_msgs::msg::Empty>("/odom_initialized", 10);
 //	timestampPublisher = nh->create_publisher<std_msgs::msg::UInt64MultiArray>("timestamp", 10);
@@ -170,6 +179,14 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 }
 
 bool PlatformDriverROS::step() {
+	// Stop when /cmd_vel goes silent; the controller then ramps down with
+	// vlin_dec_max/va_dec_max. Checked at the ROS loop rate, so the reaction
+	// time is cmd_vel_timeout plus up to one loop period.
+	if (cmdVelWatchdog.checkExpired(CommandWatchdog::Clock::now())) {
+		driver->setTargetVelocity(0, 0, 0);
+		RCLCPP_WARN(nh->get_logger(), "No /cmd_vel for %.3f s, commanding zero velocity", cmdVelWatchdog.getTimeout());
+	}
+
 	checkAndPublishSmartWheelStatus();
 
 	//calculate robot velocity
@@ -731,7 +748,8 @@ void PlatformDriverROS::joyCallbackImpl(const sensor_msgs::msg::Joy::SharedPtr j
 		driver->setCanChangeActive();
 }
 
-void PlatformDriverROS::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg) const {
+void PlatformDriverROS::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg) {
+	cmdVelWatchdog.kick(CommandWatchdog::Clock::now());
 	driver->setTargetVelocity(msg->linear.x, msg->linear.y, msg->angular.z);
 }
 

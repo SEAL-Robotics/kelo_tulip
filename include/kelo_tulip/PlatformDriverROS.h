@@ -46,6 +46,7 @@
 
 #include <memory>
 
+#include "kelo_tulip/CommandWatchdog.h"
 #include "kelo_tulip/EtherCATModuleROS.h"
 #include "kelo_tulip/PlatformDriver.h"
 #include "kelo_tulip/msg/kelo_drives_input.hpp"
@@ -115,7 +116,7 @@ protected:
 	void publishIMU();
 
 	void joyCallback(const sensor_msgs::msg::Joy::SharedPtr joy);
-	void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg) const;
+	void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
 	void resetCallback(const std_msgs::msg::Empty::SharedPtr msg) const;
 	void enableCallback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) const;
 
@@ -149,6 +150,8 @@ protected:
 
 	bool debugMode;
 	bool activeByJoypad;
+
+	CommandWatchdog cmdVelWatchdog;
 
 	bool publishTf;
 	std::string odomFrame;
