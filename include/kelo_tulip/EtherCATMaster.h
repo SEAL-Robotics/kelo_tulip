@@ -58,6 +58,7 @@ extern "C" {
 #include "kelo_tulip/soem/ethercatprint.h"
 }
 #include <boost/thread.hpp>
+#include <atomic>
 #include <string>
 #include <fstream>
 
@@ -75,6 +76,7 @@ public:
 	void reconnectSlave(int slave);
 	bool reinitializeEthercat();
 	bool needsReinit();
+	bool hasStopped() const;
 	
 	bool hasWkcError();
 	void resetErrorFlags();
@@ -111,13 +113,14 @@ protected:
 	bool ethercatInitialized;
 	boost::thread* ethercatThread;
 	boost::thread* ethercatCheckThread;
-	volatile bool stopThread;
+	// Shared with the ROS thread (hasStopped): atomic, and false until a loop gives up.
+	std::atomic<bool> stopThread{false};
 	volatile int threadPhase;
 	volatile int pauseThreadMs;
 	volatile bool ethercatWkcError;
 	volatile bool flagReconnectSlave;
 
-	bool reinitializeFlag;
+	std::atomic<bool> reinitializeFlag{false};
 	int maxReinitializationAttempt;
 	std::vector<EtherCATModule*> modules;
 

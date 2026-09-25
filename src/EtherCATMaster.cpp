@@ -487,6 +487,10 @@ bool EtherCATMaster::hasWkcError() {
 	return ethercatWkcError;
 }
 
+bool EtherCATMaster::hasStopped() const {
+	return stopThread;
+}
+
 bool EtherCATMaster::needsReinit() {
 	return reinitializeFlag;
 }

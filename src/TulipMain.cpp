@@ -41,6 +41,7 @@
  *
  ******************************************************************************/
 
+#include "kelo_tulip/DriverLiveness.h"
 #include "kelo_tulip/EtherCATMaster.h"
 #include "kelo_tulip/PlatformDriverROS.h"
 #include "kelo_tulip/modules/RobileMasterBatteryROS.h"
@@ -146,10 +147,20 @@ int main (int argc, char** argv)
 	
 	// ROS main loop
 	rclcpp::Rate rate(20.0f); // hz
+	int exitStatus = 0;
 	while (rclcpp::ok()) {
-		if (master->needsReinit())
-			master->reinitializeEthercat();
-		
+		const bool reinitAttempted = master->needsReinit();
+		const bool reinitSucceeded = reinitAttempted && master->reinitializeEthercat();
+		const kelo::LoopVerdict verdict =
+			kelo::checkEthercatLiveness(reinitAttempted, reinitSucceeded, master->hasStopped());
+		if (verdict != kelo::LoopVerdict::Continue) {
+			RCLCPP_FATAL(nh->get_logger(), "%s; exiting so the stack is restarted.",
+				verdict == kelo::LoopVerdict::ReinitFailed ?
+				"EtherCAT reinitialization failed" : "EtherCAT communication has stopped");
+			exitStatus = kelo::exitCode(verdict);
+			break;
+		}
+
 		rclcpp::spin_some(nh);		
 		
 		for (size_t i = 0; i < rosModules.size(); i++)
@@ -165,6 +176,6 @@ int main (int argc, char** argv)
 	delete master;
 	
 	rclcpp::shutdown();
-	return 0;
+	return exitStatus;
 }
 

@@ -215,6 +215,7 @@ if(BUILD_TESTING)
 	find_package(ament_cmake_gtest REQUIRED)
 	ament_add_gtest(test_command_watchdog test/test_command_watchdog.cpp)
 	ament_add_gtest(test_platform_driver_ros_watchdog test/test_platform_driver_ros_watchdog.cpp)
+	ament_add_gtest(test_driver_liveness test/test_driver_liveness.cpp)
 	target_link_libraries(test_platform_driver_ros_watchdog tulip_library)
 endif()
 
