@@ -113,11 +113,13 @@ PlatformDriver::PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, con
 	recoveryAttempt.resize(nWheels, 0);
 	lastWheelStateEntry.resize(nWheels);
 	lastRecoveryAttempt.resize(nWheels);
+	lastNormalStatus.resize(nWheels);
 	maxRecoveryAttempts = 10;
 	tRecoveryDisable = 10.0; //milliseconds
 	tRecoveryReenable = 1.0; //milliseconds
 	tRecoveryRetry = 100.0; //milliseconds
 	tRecoveryCounterReset = 30000.0; //milliseconds
+	tLatchErrorStatus = 10.0; //milliseconds
 }
 
 PlatformDriver::~PlatformDriver() {
@@ -578,21 +580,26 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 	boost::posix_time::ptime now = boost::posix_time::microsec_clock::local_time();
 	double tStateMs = (now - lastWheelStateEntry[wheel]).total_milliseconds();
 	double tLastRecoveryMs = (now - lastRecoveryAttempt[wheel]).total_milliseconds();
+	double tErrorDetectionMs = (now - lastNormalStatus[wheel]).total_milliseconds();
 
 	switch (wheelState[wheel]) {
 		case WHEEL_NORMAL_OPERATION:
-			if (processData[wheel].status1 == 60 && processData[wheel].status2 == 2051 && wheelEnabled[wheel]) {
-				recoveryAttempt[wheel]++;
-				if(recoveryAttempt[wheel] <= maxRecoveryAttempts) {
-					std::cout << "Start wheel " << wheel << " recovery" << std::endl;
-					wheelState[wheel] = WHEEL_STATUS_RECOVERY_SENDING_DISABLE; // state in next cycle
-					lastWheelStateEntry[wheel] = now;
-					lastRecoveryAttempt[wheel] = now;
-				} else {
-					std::cout << "Wheel " << wheel << " could not be recovered. Stopping operation" << std::endl;
-					wheelState[wheel] = WHEEL_FAILURE;
-					lastWheelStateEntry[wheel] = now;
+			if (processData[wheel].status1 != 63 || processData[wheel].status2 != 2051 && wheelEnabled[wheel]) {
+				if (tErrorDetectionMs > tLatchErrorStatus) {
+					recoveryAttempt[wheel]++;
+					if(recoveryAttempt[wheel] <= maxRecoveryAttempts) {
+						std::cout << "Start wheel " << wheel << " recovery" << std::endl;
+						wheelState[wheel] = WHEEL_STATUS_RECOVERY_SENDING_DISABLE; // state in next cycle
+						lastWheelStateEntry[wheel] = now;
+						lastRecoveryAttempt[wheel] = now;
+					} else {
+						std::cout << "Wheel " << wheel << " could not be recovered. Stopping operation" << std::endl;
+						wheelState[wheel] = WHEEL_FAILURE;
+						lastWheelStateEntry[wheel] = now;
+					}
 				}
+			} else {
+				lastNormalStatus[wheel] = now;
 			}
 
 			/*
@@ -630,7 +637,7 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 			break;
 
 		case WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION:
-			if (processData[wheel].status1 == 60 && processData[wheel].status2 == 2051 && wheelEnabled[wheel]) {
+			if (processData[wheel].status1 != 63 || processData[wheel].status2 != 2051 && wheelEnabled[wheel]) {
 				if(tStateMs > tRecoveryRetry)
 				{
 					std::cout << "Wheel " << wheel << " recovery failed" << std::endl;

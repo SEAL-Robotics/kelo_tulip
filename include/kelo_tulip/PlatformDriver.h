@@ -224,11 +224,13 @@ protected:
 	std::vector<unsigned int> recoveryAttempt;
 	std::vector<boost::posix_time::ptime> lastWheelStateEntry;
 	std::vector<boost::posix_time::ptime> lastRecoveryAttempt;
+	std::vector<boost::posix_time::ptime> lastNormalStatus;
 	unsigned int maxRecoveryAttempts;
 	double tRecoveryReenable;
 	double tRecoveryDisable;
 	double tRecoveryRetry;
 	double tRecoveryCounterReset;
+	double tLatchErrorStatus;
 
 private:
 	PlatformDriver(const PlatformDriver&);
