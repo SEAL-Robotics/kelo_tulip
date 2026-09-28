@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [seal]
+  pull_request:
+    branches: [seal]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy-ros-base-noble
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src/kelo_tulip
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update
+          rosdep install --from-paths src --ignore-src -y
+
+      # USE_SETCAP=OFF: the install step would otherwise call sudo setcap.
+      - name: Build
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --packages-select kelo_tulip --cmake-args -DUSE_SETCAP=OFF
+
+      - name: Test
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon test --packages-select kelo_tulip
+          colcon test-result --verbose

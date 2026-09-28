@@ -55,9 +55,9 @@ PlatformDriverROS::PlatformDriverROS()
 	debugMode = false;
 	activeByJoypad = false;
 
-	// The Jetson's state estimator owns odom -> base_footprint in production,
-	// so this driver must not publish odom TF unless explicitly asked to
-	// (bench testing, or running this driver standalone off the pod).
+	// On a robot where a separate state estimator owns odom -> base_footprint,
+	// this driver must not publish that transform too; enable it only when
+	// running the driver standalone or for bench testing.
 	publishTf = false;
 	odomFrame = "odom";
 	baseFrame = "base_footprint";
@@ -201,9 +201,9 @@ bool PlatformDriverROS::step() {
 	//publish the odometry
 	publishOdometry(vx, vy, va);
 
-	// publish_tf defaults false: on the pod, the Jetson's state estimator owns
-	// odom -> base_footprint, so this driver must not publish odom TF in
-	// production. Enable it only for bench testing or standalone use.
+	// publish_tf defaults false so the driver never competes with a separate
+	// state estimator for odom -> base_footprint. Enable it only for bench
+	// testing or standalone use.
 	if (publishTf) {
 		geometry_msgs::msg::TransformStamped odom_trans;
 		createOdomToBaseLinkTransform(odom_trans);
@@ -727,8 +727,8 @@ void PlatformDriverROS::joyCallback(const sensor_msgs::msg::Joy::SharedPtr joy) 
 	joyCallbackImpl(joy);
 }
 
-// cmd_vel is the only velocity input this driver accepts; a velocity_guard
-// node (or equivalent arbiter) is the sole publisher of that topic and is
+// cmd_vel is the only velocity input this driver accepts; a velocity arbiter
+// node is expected to be the sole publisher of that topic and to be
 // responsible for arbitrating manual/joypad input against autonomous
 // commands, obstacle and fault latches. This driver must never read the
 // joypad to drive the wheels directly -- doing so let a held deadman button

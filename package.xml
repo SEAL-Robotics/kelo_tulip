@@ -5,7 +5,9 @@
   <description>KELO Tulip software</description>
   <author email="nowak@locomotec.com">walter</author>
   <maintainer email="nowak@locomotec.com">walter</maintainer>
-  <license>internal</license>
+  <!-- Dual-licensed (user's choice), see LICENSE; vendored SOEM carries its own terms. -->
+  <license>LGPL-2.1-or-later</license>
+  <license>BSD-3-Clause</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>

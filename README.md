@@ -1,5 +1,22 @@
 # KELO Tulip
 
+> **Maintenance fork.** The `seal` branch is a maintained fork of
+> [kelo-robotics/kelo_tulip](https://github.com/kelo-robotics/kelo_tulip) for
+> ROS 2 Jazzy. It tracks the upstream ROS 2 feature branches and adds, on top:
+>
+> - a `/cmd_vel` watchdog (`cmd_vel_timeout`): stale commands ramp the platform to zero;
+> - the joypad no longer drives the wheels; `/cmd_vel` is the only velocity input;
+> - configurable `odom_frame` / `base_frame`, and `publish_tf` (default off);
+> - the EtherCAT thread really runs with `SCHED_FIFO`;
+> - KELOdrive V2 automatic wheel recovery that never re-enables a wheel disabled
+>   through `setWheelsEnable`, disables a wheel it gives up on, and uses a
+>   monotonic clock;
+> - INIT re-runs the drive start sequence up to 3 times before giving up;
+> - `platform_driver` exits (non-zero) once its EtherCAT loop has stopped, so a
+>   process supervisor can restart it instead of it idling with dead drives.
+>
+> Licensing is unchanged from upstream: see [LICENSE](LICENSE).
+
 This package contains the *KELO Tulip* software. This software takes a velocity vector for the overall platform and converts it to commands for the individual KELO Drives of the platform. It implements an EtherCAT master to communicate with the KELO Drives and provides a simple velocity controller that can be used on real robots as well as for simulation.
 
 ## KELO Drives and how to build a platform
@@ -12,6 +29,7 @@ You can move your mobile platform via a joypad for test purposes or use any soft
 ## System requirements
 
 This software was tested on Ubuntu 20.04 with ROS Foxy and Ubuntu 22.04 with ROS Humble.
+The `seal` branch is built and tested on Ubuntu 24.04 with ROS Jazzy.
 For ROS1 version please read the documentation on the master branch.
 
 For the ROS version it is enough to install the base system (for Humble ros-humble-ros-base).
@@ -27,6 +45,17 @@ git clone -b ros2-develop https://github.com/kelo-robotics/kelo_tulip.git
 cd ..
 colcon build
 ~~~
+
+The unit tests (gtest) run with:
+
+~~~ sh
+colcon build --packages-select kelo_tulip --cmake-args -DUSE_SETCAP=OFF
+colcon test --packages-select kelo_tulip
+colcon test-result --verbose
+~~~
+
+`-DUSE_SETCAP=OFF` skips the install step that grants the driver its network
+capabilities with `sudo setcap`; grant them separately on the robot.
 
 ## Usage
 ### Starting the program
@@ -129,15 +158,13 @@ Commands must keep arriving: if no message is received for `cmd_vel_timeout` sec
 
 #### /joy
 
-By sending messages to the `/joy` topic the platform can be moved by a joypad. The [`joy` ROS package](http://wiki.ros.org/joy) can be used to send these messages via joypad. In the function `joyCallback()` in `PlatformDriverROS.cpp` is a simple translation between joystick input and platform velocity command.
-
-Note: For safety reasons joystick messages are only considered if the `RB` button on the joypad is pressed, resp. the joy button with index 5 is active. This makes it also possible to run it in parallel with other packages that already process joystick input, overriding their input as long as the `RB` button keeps being pressed.
+On the `seal` branch the joypad does not drive the wheels: `/cmd_vel` is the only velocity input, so manual driving goes through whatever node publishes `/cmd_vel` (for example a velocity arbiter that also handles the joypad). `/joy` is only used when `active_by_joypad` is true: holding the button with index 5 (`RB`) then lets the driver switch from READY to ACTIVE once.
 
 #### /odom and /tf
 
 On the topic `/odom` odometry data in form of [`nav_msgs/Odometry`](https://docs.ros2.org/foxy/api/nav_msgs/msg/Odometry.html) are published. Each time the program is started, the position is reset to the origin.
 
-The same odometry data is published also on the topic `/tf` in the form of tf transform from the frame `base_link` to `odom`.
+With `publish_tf` set to true (default false), the same odometry is also published on `/tf` as the transform `odom_frame` → `base_frame` (defaults `odom` → `base_footprint`). Leave it off when another node, such as a state estimator, owns that transform.
 
 #### /status
 
