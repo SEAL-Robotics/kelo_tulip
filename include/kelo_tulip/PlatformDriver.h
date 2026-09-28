@@ -61,7 +61,11 @@ extern "C" {
 #include "kelo_tulip/VelocityPlatformController.h"
 #include "kelo_tulip/Utils.h"
 #include "kelo_tulip/WheelConfig.h"
+#include "kelo_tulip/WheelRecovery.h"
 #include <boost/thread.hpp>
+#include <atomic>
+#include <chrono>
+#include <memory>
 #include <string>
 #include <fstream>
 
@@ -160,6 +164,8 @@ protected:
 	virtual void doStop();
 	virtual void doControl();
 	void doWheelRecovery(unsigned int wheel);
+	bool anyWheelFailed() const;
+	void applyWheelEnable(unsigned int wheel);
 
 	bool hasWheelStatusEnabled(unsigned int wheel);
 	bool hasWheelStatusError(unsigned int wheel);
@@ -191,7 +197,12 @@ protected:
 	double encCalibrationTolerance;
 	volatile bool ethercatWkcError;
 	volatile bool flagReconnectSlave;
+	// Effective enable per wheel, written only by the EtherCAT thread (step).
 	std::vector<bool> wheelEnabled;
+	// setWheelsEnable runs on the ROS thread, so the operator's intent is
+	// atomic and kept apart from what recovery allows.
+	std::unique_ptr<std::atomic<bool>[]> operatorEnable;
+	std::vector<bool> recoveryAllowsEnable;
 	
 	int firstWheel, nWheels;
 	std::vector<WheelConfig> wheelConfigs;
@@ -212,12 +223,20 @@ protected:
 	int initTolerance;
 	int initCounter;
 
+	// INIT: bounded re-runs of the disable-then-enable start sequence.
+	int initAttemptStartStep;
+	unsigned int initResets;
+	unsigned int maxInitResets;
+	unsigned int initTimeoutSteps;
+
 	//recovery behavior
+	// Monotonic: chrony steps the wall clock on this host.
+	using RecoveryClock = std::chrono::steady_clock;
 	std::vector<WheelState> wheelState;
 	std::vector<unsigned int> recoveryAttempt;
-	std::vector<boost::posix_time::ptime> lastWheelStateEntry;
-	std::vector<boost::posix_time::ptime> lastRecoveryAttempt;
-	std::vector<boost::posix_time::ptime> lastNormalStatus;
+	std::vector<RecoveryClock::time_point> lastWheelStateEntry;
+	std::vector<RecoveryClock::time_point> lastRecoveryAttempt;
+	std::vector<RecoveryClock::time_point> lastNormalStatus;
 	unsigned int maxRecoveryAttempts;
 	double tRecoveryReenable;
 	double tRecoveryDisable;

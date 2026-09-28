@@ -216,6 +216,7 @@ if(BUILD_TESTING)
 	ament_add_gtest(test_command_watchdog test/test_command_watchdog.cpp)
 	ament_add_gtest(test_platform_driver_ros_watchdog test/test_platform_driver_ros_watchdog.cpp)
 	ament_add_gtest(test_driver_liveness test/test_driver_liveness.cpp)
+	ament_add_gtest(test_wheel_recovery test/test_wheel_recovery.cpp)
 	target_link_libraries(test_platform_driver_ros_watchdog tulip_library)
 endif()
 

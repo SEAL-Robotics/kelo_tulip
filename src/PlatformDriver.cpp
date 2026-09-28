@@ -68,6 +68,10 @@ PlatformDriver::PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, con
 
 	nWheels = wheelConfigs.size();
 	wheelEnabled.resize(nWheels, true);
+	operatorEnable.reset(new std::atomic<bool>[nWheels]);
+	for (int i = 0; i < nWheels; i++)
+		operatorEnable[i].store(true);
+	recoveryAllowsEnable.resize(nWheels, true);
 
 	// controller parameters
 	maxvlin = 1.5;
@@ -108,12 +112,18 @@ PlatformDriver::PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, con
 
 	velocityPlatformController.initialise(wheelConfigs);
 
+	initAttemptStartStep = 0;
+	initResets = 0;
+	maxInitResets = 3;
+	initTimeoutSteps = 500;
+
 	//recovery behavior
+	const RecoveryClock::time_point now = RecoveryClock::now();
 	wheelState.resize(nWheels, WHEEL_NORMAL_OPERATION);
 	recoveryAttempt.resize(nWheels, 0);
-	lastWheelStateEntry.resize(nWheels);
-	lastRecoveryAttempt.resize(nWheels);
-	lastNormalStatus.resize(nWheels);
+	lastWheelStateEntry.resize(nWheels, now);
+	lastRecoveryAttempt.resize(nWheels, now);
+	lastNormalStatus.resize(nWheels, now);
 	maxRecoveryAttempts = 10;
 	tRecoveryDisable = 10.0; //milliseconds
 	tRecoveryReenable = 1.0; //milliseconds
@@ -168,6 +178,8 @@ bool PlatformDriver::step() {
 	
 	updateStatusError();
 	updateEncoders();
+	for (int i = 0; i < nWheels; i++)
+		applyWheelEnable(i);
 
 	switch (state) {
 		case DRIVER_STATE_INIT:   return stepInit();
@@ -195,12 +207,27 @@ bool PlatformDriver::stepInit() {
 		std::cout << "PlatformDriver from INIT to READY" << std::endl;
 		resetErrorFlags();
 	}
-		
-	if (stepCount > 500 && !ready) {
-		std::cout << "Stopping platform driver, because wheels don't become ready." << std::endl;
-		return false;
+
+	switch (initTimeoutAction(ready, static_cast<unsigned int>(stepCount - initAttemptStartStep),
+		initTimeoutSteps, initResets, maxInitResets)) {
+		case InitAction::ResetWheels:
+			initResets++;
+			std::cout << "Wheels not ready after " << initTimeoutSteps << " steps, re-running the start sequence ("
+				<< initResets << "/" << maxInitResets << ")." << std::endl;
+			// doStop sends disable again until initCounter passes initTolerance, then enable.
+			initCounter = 0;
+			initAttemptStartStep = stepCount;
+			// As on a fresh start, so hasWheelStatusError's calibration allowance applies again.
+			for (int wheel = 0; wheel < nWheels; wheel++)
+				abs_sum_encoder[wheel].assign(2, 0.0);
+			break;
+		case InitAction::GiveUp:
+			std::cout << "Stopping platform driver, because wheels don't become ready." << std::endl;
+			return false;
+		case InitAction::Wait:
+			break;
 	}
-	
+
 	return true;
 }
 
@@ -223,7 +250,24 @@ bool PlatformDriver::stepReady() {
 
 bool PlatformDriver::stepActive() {
 	doControl();
+	// A wheel recovery gave up on is disabled; driving on the others is not
+	// safe, so stop EtherCAT and let the stack restart.
+	if (anyWheelFailed()) {
+		std::cout << "Stopping platform driver, because a wheel could not be recovered." << std::endl;
+		return false;
+	}
 	return true;
+}
+
+void PlatformDriver::applyWheelEnable(unsigned int wheel) {
+	wheelEnabled[wheel] = effectiveWheelEnable(operatorEnable[wheel].load(), recoveryAllowsEnable[wheel]);
+}
+
+bool PlatformDriver::anyWheelFailed() const {
+	for (int i = 0; i < nWheels; i++)
+		if (wheelState[i] == WHEEL_FAILURE)
+			return true;
+	return false;
 }
 
 bool PlatformDriver::stepError() {
@@ -383,16 +427,16 @@ void PlatformDriver::resetErrorFlags() {
 }
 
 void PlatformDriver::setWheelsEnable(std::vector<int> values) {
-	if (wheelEnabled.size() != values.size()) {
+	if (static_cast<size_t>(nWheels) != values.size()) {
 		std::cout << "Number of wheels do not match. Ignoring enable command" << std::endl;
 		return;
 	}
-	
-	for (int i = 0; i < (int)wheelEnabled.size(); i++) {
+
+	for (int i = 0; i < nWheels; i++) {
 		if (values[i] == 1)
-			wheelEnabled[i] = true;
+			operatorEnable[i].store(true);
 		else if (values[i] == 0)
-			wheelEnabled[i] = false;
+			operatorEnable[i].store(false);
 		else
 			std::cout << "wheel enable value is invalid. Ignoring enable value" << std::endl;
 	}
@@ -570,14 +614,30 @@ void PlatformDriver::doControl() {
 }
 
 void PlatformDriver::doWheelRecovery(unsigned int wheel) {
-	boost::posix_time::ptime now = boost::posix_time::microsec_clock::local_time();
-	double tStateMs = (now - lastWheelStateEntry[wheel]).total_milliseconds();
-	double tLastRecoveryMs = (now - lastRecoveryAttempt[wheel]).total_milliseconds();
-	double tErrorDetectionMs = (now - lastNormalStatus[wheel]).total_milliseconds();
+	const RecoveryClock::time_point now = RecoveryClock::now();
+	const auto elapsedMs = [&now](RecoveryClock::time_point since) {
+		return std::chrono::duration<double, std::milli>(now - since).count();
+	};
+	double tStateMs = elapsedMs(lastWheelStateEntry[wheel]);
+	double tLastRecoveryMs = elapsedMs(lastRecoveryAttempt[wheel]);
+	double tErrorDetectionMs = elapsedMs(lastNormalStatus[wheel]);
+	const bool operatorWants = operatorEnable[wheel].load();
+	const bool needsRecovery =
+		wheelNeedsRecovery(processData[wheel].status1, processData[wheel].status2, operatorWants);
+
+	const bool recovering = wheelState[wheel] == WHEEL_STATUS_RECOVERY_SENDING_DISABLE ||
+		wheelState[wheel] == WHEEL_STATUS_RECOVERY_SENDING_ENABLE ||
+		wheelState[wheel] == WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION;
+	if (recovering && !operatorWants) {
+		std::cout << "Wheel " << wheel << " recovery aborted: wheel disabled by operator" << std::endl;
+		wheelState[wheel] = WHEEL_NORMAL_OPERATION;
+		recoveryAllowsEnable[wheel] = true;
+		lastWheelStateEntry[wheel] = now;
+	}
 
 	switch (wheelState[wheel]) {
 		case WHEEL_NORMAL_OPERATION:
-			if (processData[wheel].status1 != 63 || processData[wheel].status2 != 2051 && wheelEnabled[wheel]) {
+			if (needsRecovery) {
 				if (tErrorDetectionMs > tLatchErrorStatus) {
 					recoveryAttempt[wheel]++;
 					if(recoveryAttempt[wheel] <= maxRecoveryAttempts) {
@@ -588,6 +648,7 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 					} else {
 						std::cout << "Wheel " << wheel << " could not be recovered. Stopping operation" << std::endl;
 						wheelState[wheel] = WHEEL_FAILURE;
+						recoveryAllowsEnable[wheel] = false;
 						lastWheelStateEntry[wheel] = now;
 					}
 				}
@@ -608,11 +669,11 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 			break;
 
 		case WHEEL_FAILURE:
-			//disable (permanently)
+			recoveryAllowsEnable[wheel] = false;
 			break;
 
 		case WHEEL_STATUS_RECOVERY_SENDING_DISABLE:
-			wheelEnabled[wheel] = false;
+			recoveryAllowsEnable[wheel] = false;
 
 			if(tStateMs > tRecoveryDisable) {
 				wheelState[wheel] = WHEEL_STATUS_RECOVERY_SENDING_ENABLE;
@@ -621,7 +682,7 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 			break;
 
 		case WHEEL_STATUS_RECOVERY_SENDING_ENABLE:
-			wheelEnabled[wheel] = true;
+			recoveryAllowsEnable[wheel] = true;
 
 			if(tStateMs > tRecoveryReenable) {
 				wheelState[wheel] = WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION;
@@ -630,7 +691,7 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 			break;
 
 		case WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION:
-			if (processData[wheel].status1 != 63 || processData[wheel].status2 != 2051 && wheelEnabled[wheel]) {
+			if (needsRecovery) {
 				if(tStateMs > tRecoveryRetry)
 				{
 					std::cout << "Wheel " << wheel << " recovery failed" << std::endl;
@@ -647,6 +708,8 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 		default:
 			break;
 	}
+
+	applyWheelEnable(wheel);
 }
 
 
