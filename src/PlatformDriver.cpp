@@ -584,7 +584,7 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 
 	switch (wheelState[wheel]) {
 		case WHEEL_NORMAL_OPERATION:
-			if (processData[wheel].status1 != 63 || processData[wheel].status2 != 2051 && wheelEnabled[wheel]) {
+			if ((processData[wheel].status1 != 63 || processData[wheel].status2 != 2051) && wheelEnabled[wheel]) {
 				if (tErrorDetectionMs > tLatchErrorStatus) {
 					recoveryAttempt[wheel]++;
 					if(recoveryAttempt[wheel] <= maxRecoveryAttempts) {
@@ -615,7 +615,8 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 			break;
 
 		case WHEEL_FAILURE:
-			//disable (permanently)
+			//stop trying to re-enable the wheel
+			wheelEnabled[wheel] = false;
 			break;
 
 		case WHEEL_STATUS_RECOVERY_SENDING_DISABLE:
@@ -637,7 +638,7 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 			break;
 
 		case WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION:
-			if (processData[wheel].status1 != 63 || processData[wheel].status2 != 2051 && wheelEnabled[wheel]) {
+			if ((processData[wheel].status1 != 63 || processData[wheel].status2 != 2051) && wheelEnabled[wheel]) {
 				if(tStateMs > tRecoveryRetry)
 				{
 					std::cout << "Wheel " << wheel << " recovery failed" << std::endl;
