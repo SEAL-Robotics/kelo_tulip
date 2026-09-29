@@ -91,6 +91,7 @@ int main (int argc, char** argv)
 	nh->declare_parameter("start_retry_delay", 0);
 	nh->declare_parameter("robile_master_battery_ethercat_number", 0);
 	nh->declare_parameter("device", "");
+	nh->declare_parameter("enable_ethercat_recovery", false);
 
 	std::vector<kelo::EtherCATModuleROS*> rosModules;
 
@@ -128,6 +129,7 @@ int main (int argc, char** argv)
 	// create and configure EtherCAT master
 	std::string device = nh->get_parameter("device").as_string();
 	int delayRetry = nh->get_parameter("start_retry_delay").as_int();
+	bool enableEthercatRecovery = nh->get_parameter("enable_ethercat_recovery").as_bool();
 
 	kelo::EtherCATMaster* master = new kelo::EtherCATMaster(device, etherCATmodules);
 	if (!master) {
@@ -149,7 +151,7 @@ int main (int argc, char** argv)
 	rclcpp::Rate rate(20.0f); // hz
 	int exitStatus = 0;
 	while (rclcpp::ok()) {
-		const bool reinitAttempted = master->needsReinit();
+		const bool reinitAttempted = enableEthercatRecovery && master->needsReinit();
 		const bool reinitSucceeded = reinitAttempted && master->reinitializeEthercat();
 		const kelo::LoopVerdict verdict =
 			kelo::checkEthercatLiveness(reinitAttempted, reinitSucceeded, master->hasStopped());
