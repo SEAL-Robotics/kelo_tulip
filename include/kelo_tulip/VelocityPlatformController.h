@@ -49,6 +49,7 @@
 #include <kelo_tulip/Utils.h>
 #include <kelo_tulip/Structs.h>
 #include <kelo_tulip/WheelConfig.h>
+#include <kelo_tulip/CurrentShaping.h>
 #include <boost/thread.hpp>
 #include <iostream>
 
@@ -73,6 +74,13 @@ namespace kelo
             void setPlatformMaxAngDeceleration(float max_dec_angular);
             
             void calculatePlatformRampedVelocities();
+            //! Same, for a caller-supplied time step (s).
+            void calculatePlatformRampedVelocities(float time_delta);
+
+            void setCurrentShaping(const CurrentShapingConfig& config);
+            //! A disabled or recovering wheel is commanded 0, keeps no slew
+            //! state and does not count as the worst caster.
+            void setWheelActive(size_t wheel_index, bool active);
 
             void calculateWheelTargetVelocity(const size_t &wheel_index,
                                               const float &pivot_angle,
@@ -101,6 +109,13 @@ namespace kelo
                 float max_dec_linear;
                 float max_dec_angular;
         	  } platform_limits_;
+
+            CurrentShapingConfig shaping_;
+            std::vector<float> last_target_l_, last_target_r_;  // slew state, rad/s
+            std::vector<bool> wheel_active_;
+            std::vector<float> last_pivot_error_;  // |rad|, for re-orient-first
+            float reorient_scale_ = 1.0f;
+            float ramp_dt_ = 0.0f;  // s, last ramping step
 
         	  boost::posix_time::ptime time_last_ramping;
         	  bool first_ramping_call;

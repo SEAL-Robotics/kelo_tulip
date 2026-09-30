@@ -17,6 +17,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -91,6 +92,12 @@ add_library(tulip_library
 	src/EtherCATModuleROS.cpp
 	src/PlatformDriver.cpp
 	src/PlatformDriverROS.cpp
+	src/EscCounters.cpp
+	src/DumpPolicy.cpp
+	src/EthercatBlackBox.cpp
+	src/EscDiagnostics.cpp
+	src/RtLog.cpp
+	src/EscDiagnosticsRos.cpp
 	src/modules/RobileMasterBattery.cpp
 	src/modules/RobileMasterBatteryROS.cpp
 )
@@ -101,6 +108,7 @@ ament_target_dependencies(tulip_library
 	nav_msgs
 	sensor_msgs
 	std_msgs
+	diagnostic_msgs
 	tf2
 	tf2_ros
 	tf2_geometry_msgs
@@ -209,6 +217,7 @@ ament_export_dependencies(rosidl_default_runtime)
 ament_export_include_directories(${INCLUDE_DIRS})
 ament_export_dependencies(Boost)
 ament_export_dependencies(std_msgs)
+ament_export_dependencies(diagnostic_msgs)
 ament_export_libraries(tulip_library tulip_velocity_controller soem)
 
 if(BUILD_TESTING)
@@ -217,6 +226,27 @@ if(BUILD_TESTING)
 	ament_add_gtest(test_platform_driver_ros_watchdog test/test_platform_driver_ros_watchdog.cpp)
 	ament_add_gtest(test_driver_liveness test/test_driver_liveness.cpp)
 	ament_add_gtest(test_wheel_recovery test/test_wheel_recovery.cpp)
+	ament_add_gtest(test_odometry_freshness test/test_odometry_freshness.cpp)
+	ament_add_gtest(test_wheel_recovery_machine test/test_wheel_recovery_machine.cpp)
+	ament_add_gtest(test_esc_counters test/test_esc_counters.cpp)
+	target_link_libraries(test_esc_counters tulip_library)
+	ament_add_gtest(test_dump_policy test/test_dump_policy.cpp)
+	target_link_libraries(test_dump_policy tulip_library)
+	ament_add_gtest(test_seqlock_ring test/test_seqlock_ring.cpp)
+	target_link_libraries(test_seqlock_ring pthread)
+	ament_add_gtest(test_ethercat_blackbox test/test_ethercat_blackbox.cpp)
+	target_link_libraries(test_ethercat_blackbox tulip_library)
+	ament_add_gtest(test_platform_driver_recovery test/test_platform_driver_recovery.cpp)
+	target_link_libraries(test_platform_driver_recovery tulip_library)
+	ament_add_gtest(test_soem_close test/test_soem_close.cpp)
+	target_link_libraries(test_soem_close tulip_library)
+	ament_add_gtest(test_rt_log test/test_rt_log.cpp)
+	target_link_libraries(test_rt_log tulip_library)
+	ament_add_gtest(test_esc_diagnostics_ros test/test_esc_diagnostics_ros.cpp)
+	target_link_libraries(test_esc_diagnostics_ros tulip_library)
+	ament_add_gtest(test_current_shaping test/test_current_shaping.cpp)
+	ament_add_gtest(test_velocity_platform_controller test/test_velocity_platform_controller.cpp)
+	target_link_libraries(test_velocity_platform_controller tulip_velocity_controller)
 	target_link_libraries(test_platform_driver_ros_watchdog tulip_library)
 endif()
 

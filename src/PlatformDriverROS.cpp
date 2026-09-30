@@ -43,6 +43,10 @@
 
 
 #include "kelo_tulip/PlatformDriverROS.h"
+#include "kelo_tulip/OdometryFreshness.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace kelo {
 
@@ -65,6 +69,9 @@ PlatformDriverROS::PlatformDriverROS()
 	odomx = 0;
 	odomy = 0;
 	odoma = 0;
+	staleTwistCovariance = 1e6;
+	encoderDeltaLimit = 0.1;
+	maxHeldGap = 0.1;
 }
 
 PlatformDriverROS::~PlatformDriverROS() {
@@ -92,6 +99,24 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	nh->declare_parameter("base_frame", baseFrame);
 	nh->declare_parameter("publish_tf", publishTf);
 	nh->declare_parameter("cmd_vel_timeout", cmdVelWatchdog.getTimeout());
+	nh->declare_parameter("odom_stale_ticks", OdometryFreshnessTracker::DEFAULT_STALE_TICKS);
+	nh->declare_parameter("stale_twist_covariance", staleTwistCovariance);
+
+	// Dynamic typing so an integer in the yaml (30 for 30.0) is read, not thrown on.
+	const CurrentShapingConfig shapingDefaults;
+	rcl_interfaces::msg::ParameterDescriptor anyNumber;
+	anyNumber.dynamic_typing = true;
+	const std::pair<const char *, float> shapingParams[] = {
+		{"wheel_slew_rate", shapingDefaults.slewRateRadPerSecSq},
+		{"pivot_kp", shapingDefaults.pivotKp},
+		{"pivot_max_error", shapingDefaults.maxPivotError},
+		{"pivot_max_correction_speed", shapingDefaults.maxPivotCorrectionSpeed},
+		{"reorient_start_error", shapingDefaults.reorientStartError},
+		{"reorient_full_error", shapingDefaults.reorientFullError},
+		{"reorient_min_scale", shapingDefaults.reorientMinScale},
+	};
+	for (const auto &param : shapingParams)
+		nh->declare_parameter(param.first, rclcpp::ParameterValue((double)param.second), anyNumber);
 
 	rclcpp::Parameter num_wheels;
 	if (!nh->get_parameter("num_wheels", num_wheels)) {
@@ -117,6 +142,30 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	readWheelConfig();
 
 	driver = createDriver();
+
+	// Anything but an int or a double reads as NaN, which isValid rejects.
+	auto shapingNumber = [&nh](const char *name) {
+		const rclcpp::Parameter param = nh->get_parameter(name);
+		switch (param.get_type()) {
+			case rclcpp::ParameterType::PARAMETER_DOUBLE: return param.as_double();
+			case rclcpp::ParameterType::PARAMETER_INTEGER: return (double)param.as_int();
+			default: return std::numeric_limits<double>::quiet_NaN();
+		}
+	};
+	CurrentShapingConfig shaping;
+	shaping.slewRateRadPerSecSq = shapingNumber("wheel_slew_rate");
+	shaping.pivotKp = shapingNumber("pivot_kp");
+	shaping.maxPivotError = shapingNumber("pivot_max_error");
+	shaping.maxPivotCorrectionSpeed = shapingNumber("pivot_max_correction_speed");
+	shaping.reorientStartError = shapingNumber("reorient_start_error");
+	shaping.reorientFullError = shapingNumber("reorient_full_error");
+	shaping.reorientMinScale = shapingNumber("reorient_min_scale");
+	std::string shapingProblem;
+	if (!isValid(shaping, &shapingProblem)) {
+		RCLCPP_ERROR(nh->get_logger(), "%s; current shaping is off", shapingProblem.c_str());
+		shaping = CurrentShapingConfig();
+	}
+	driver->setCurrentShaping(shaping);
 
 	// set driver control parameters
 	rclcpp::Parameter x;
@@ -149,6 +198,21 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	rclcpp::Parameter publishTfParam;
 	if (nh->get_parameter("publish_tf", publishTfParam))
 		publishTf = publishTfParam.as_bool();
+
+	int staleTicks = nh->get_parameter("odom_stale_ticks").as_int();
+	if (staleTicks < 1) {
+		RCLCPP_ERROR(nh->get_logger(), "odom_stale_ticks %d is below 1, using %d",
+			staleTicks, OdometryFreshnessTracker::DEFAULT_STALE_TICKS);
+		staleTicks = OdometryFreshnessTracker::DEFAULT_STALE_TICKS;
+	}
+	encoderDeltaLimit = encoderDeltaLimitSec(staleTicks, LOOP_PERIOD_SEC, wheelAliasingLimitSec());
+	maxHeldGap = staleTicks * LOOP_PERIOD_SEC + 0.5 * LOOP_PERIOD_SEC;
+	freshnessTracker = std::make_unique<OdometryFreshnessTracker>(nWheels, staleTicks);
+	staleTwistCovariance = nh->get_parameter("stale_twist_covariance").as_double();
+	if (!isValidStaleTwistCovariance(staleTwistCovariance)) {
+		RCLCPP_ERROR(nh->get_logger(), "stale_twist_covariance %f must be finite and > 0, using 1e6", staleTwistCovariance);
+		staleTwistCovariance = 1e6;
+	}
 
 	// If the /cmd_vel publisher dies or stalls, the last command would
 	// otherwise be held forever. There is deliberately no way to disable this.
@@ -191,7 +255,15 @@ bool PlatformDriverROS::step() {
 	//calculate robot velocity
 	double vx, vy, va, displacement, dt;
 	//calculateRobotVelocity(vx, vy, va, displacement);
-	calculateRobotVelocity2(vx, vy, va, displacement, dt);
+	OdometryFreshnessTracker::Update freshness = calculateRobotVelocity2(vx, vy, va, displacement, dt);
+	// Without fresh wheel data the velocities are zero and the pose does not
+	// move: reporting the frozen last motion would drift the state estimator.
+	if (freshness.noDataWarning)
+		RCLCPP_ERROR(nh->get_logger(), "No wheel data received since start, odometry stays at zero");
+	if (freshness.becameStale)
+		RCLCPP_ERROR(nh->get_logger(), "Wheel data is stale, publishing zero odometry velocity");
+	else if (freshness.becameFresh)
+		RCLCPP_WARN(nh->get_logger(), "Wheel data is fresh again, odometry resumes");
 
 	//calculate robot displacement and current pose
 	//calculateRobotPose(vx, vy, va);
@@ -199,7 +271,7 @@ bool PlatformDriverROS::step() {
 
 		
 	//publish the odometry
-	publishOdometry(vx, vy, va);
+	publishOdometry(vx, vy, va, holdOdometry(freshness.stale, freshness.noNewSample));
 
 	// publish_tf defaults false so the driver never competes with a separate
 	// state estimator for odom -> base_footprint. Enable it only for bench
@@ -385,11 +457,26 @@ double norm(double x) {
 	return x;
 }
 
+// A wheel's ground speed is at most the translation limit plus the rim speed
+// of the yaw limit; the driver clips both, so these bound the encoder rate.
+double PlatformDriverROS::wheelAliasingLimitSec() {
+	if (nWheels == 0)
+		return encoderAliasingLimitSec(0.0, 0.0);
+	double vlinMax = nh->get_parameter("vlin_max").as_double();
+	double vaMax = nh->get_parameter("va_max").as_double();
+	double minRadius = std::numeric_limits<double>::max();
+	double maxDistance = 0.0;
+	for (int i = 0; i < nWheels; i++) {
+		minRadius = std::min(minRadius, 0.5 * wheelConfigs[i].model.diameter);
+		maxDistance = std::max(maxDistance, std::hypot(wheelConfigs[i].x, wheelConfigs[i].y));
+	}
+	return encoderAliasingLimitSec(minRadius, vlinMax + vaMax * maxDistance);
+}
+
 void PlatformDriverROS::initializeEncoderValue() {
 	prev_left_enc.resize(nWheels, 0);
 	prev_right_enc.resize(nWheels, 0);
 	prev_pivot_enc.resize(nWheels, 0);
-	prev_ts.resize(nWheels, 0);
 
 	for (int i=0; i<nWheels; i++) {
 		std::vector<double> encoderValueInit = driver->getEncoderValue(i);
@@ -478,8 +565,8 @@ void PlatformDriverROS::calculateRobotPose(double vx, double vy, double va) {
 	odoma = norm(odoma + va * dt);
 }
 
-void PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& va, double& displacement, double &dt) {
-	dt = 0.05; // Target delta time. Replaced by real delta from sensor timestamps, when available.
+OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& va, double& displacement, double &dt) {
+	dt = LOOP_PERIOD_SEC; // Target delta time. Replaced by real delta from sensor timestamps, when available.
 	std::vector<double> rx;
 	rx.resize(nWheels, 0);
 	std::vector<double> ry;
@@ -490,33 +577,51 @@ void PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& 
 	vy = 0;
 	va = 0;
 	displacement = 0;
-	
-	for (int i = 0; i < nWheels; i++) {
-		volatile txpdo1_t* swData = driver->getWheelProcessData(i);
+
+	struct Sample {
 		uint64_t sensor_ts;
 		float encoder_1, encoder_2, encoder_pivot, velocity_1, velocity_2, velocity_pivot;
+	};
+	std::vector<Sample> samples(nWheels);
+	std::vector<uint64_t> timestamps(nWheels);
+	for (int i = 0; i < nWheels; i++) {
+		volatile txpdo1_t* swData = driver->getWheelProcessData(i);
+		Sample& sm = samples[i];
 		int repcnt = 3;
 		// read mutiple times if data has changed while reading
 		do
 		{
-			sensor_ts = swData->sensor_ts;
-			encoder_1 = swData->encoder_1;
-			encoder_2 = swData->encoder_2;
-			encoder_pivot = swData->encoder_pivot;
-			velocity_1 = swData->velocity_1;
-			velocity_2 = swData->velocity_2;
-			velocity_pivot = swData->velocity_pivot;
-		} while ((sensor_ts != swData->sensor_ts) && --repcnt);
-		double delta_ts = (sensor_ts - prev_ts[i]) * 0.000000001;
-		prev_ts[i] = sensor_ts;
+			sm.sensor_ts = swData->sensor_ts;
+			sm.encoder_1 = swData->encoder_1;
+			sm.encoder_2 = swData->encoder_2;
+			sm.encoder_pivot = swData->encoder_pivot;
+			sm.velocity_1 = swData->velocity_1;
+			sm.velocity_2 = swData->velocity_2;
+			sm.velocity_pivot = swData->velocity_pivot;
+		} while ((sm.sensor_ts != swData->sensor_ts) && --repcnt);
+		timestamps[i] = sm.sensor_ts;
+	}
+	OdometryFreshnessTracker::Update freshness = freshnessTracker->update(timestamps);
+
+	double encoderDt = 0.0;
+	for (int i = 0; i < nWheels; i++) {
+		const float encoder_1 = samples[i].encoder_1, encoder_2 = samples[i].encoder_2;
+		const float encoder_pivot = samples[i].encoder_pivot;
+		const float velocity_1 = samples[i].velocity_1, velocity_2 = samples[i].velocity_2;
+		const float velocity_pivot = samples[i].velocity_pivot;
+		double delta_ts = freshnessTracker->deltaNs(i) * 0.000000001;
 
 		double wl, wr, wp;
-		if((delta_ts <= 0.0) || (delta_ts > 0.1))
+		// The encoder delta is only trusted over a plausible interval: never
+		// across the gap after stale data (a drive re-init can restart
+		// sensor_ts near zero), and not without a new sample (delta_ts == 0).
+		if(!isEncoderDeltaUsable(delta_ts, freshness.resync, encoderDeltaLimit))
 		{
-			// delta time too large, or zero, to calculate velocities from encoder position, use drive velocities
 			wl = velocity_1;
 			wr = -velocity_2;
 			wp = velocity_pivot;
+			double fallbackDt = fallbackDtSec(delta_ts, freshness.resync, maxHeldGap, LOOP_PERIOD_SEC);
+			if (fallbackDt > encoderDt) encoderDt = fallbackDt;
 		}
 		else
 		{
@@ -524,11 +629,17 @@ void PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& 
 			wr = -norm(encoder_2 - prev_right_enc[i]) / delta_ts;
 			wp = norm(encoder_pivot - prev_pivot_enc[i]) / delta_ts;
 			if(fabs(velocity_pivot) > 10 * M_PI) wp = velocity_pivot;
-			dt = delta_ts;
+			// Every wheel's baseline advances together, so the deltas agree to
+			// within the sync jitter; the pose needs one dt for the fused velocity.
+			if (delta_ts > encoderDt) encoderDt = delta_ts;
 		}
-		prev_left_enc[i] = encoder_1;
-		prev_right_enc[i] = encoder_2;
-		prev_pivot_enc[i] = encoder_pivot;
+		// Held steps keep the old baseline so the next used step's delta covers
+		// the gap the pose skipped.
+		if (!holdOdometry(freshness.stale, freshness.noNewSample)) {
+			prev_left_enc[i] = encoder_1;
+			prev_right_enc[i] = encoder_2;
+			prev_pivot_enc[i] = encoder_pivot;
+		}
 		if (wheelConfigs[i].reverseVelocity) {
 			wl *= -1.0;
 			wr *= -1.0;
@@ -549,6 +660,8 @@ void PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& 
 		vx += rx[i];
 		vy += ry[i];
 	}
+	if (encoderDt > 0.0) dt = encoderDt;
+
 	// calcultate cartesian velocity of robot center from average of all wheel units
 	if (nWheels > 1) {
 		vx /= nWheels;
@@ -585,6 +698,14 @@ void PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& 
 	}
 	// calculate angular velocity of robot center from average of all wheel units
 	if(d_sum > 0.0) va = v_sum / d_sum;
+
+	if (holdOdometry(freshness.stale, freshness.noNewSample)) {
+		vx = 0;
+		vy = 0;
+		va = 0;
+		displacement = 0;
+	}
+	return freshness;
 }
 
 void PlatformDriverROS::calculateRobotPose2(double vx, double vy, double va, double dt) {
@@ -600,7 +721,7 @@ void PlatformDriverROS::calculateRobotPose2(double vx, double vy, double va, dou
 	odoma = norm(odoma + (va * dt));
 }
 
-void PlatformDriverROS::publishOdometry(double vx, double vy, double va) {
+void PlatformDriverROS::publishOdometry(double vx, double vy, double va, bool wheelDataStale) {
 	tf2::Quaternion odom_quat;
 	odom_quat.setRPY(0, 0, odoma);
 	nav_msgs::msg::Odometry odom;
@@ -615,13 +736,13 @@ void PlatformDriverROS::publishOdometry(double vx, double vy, double va) {
 	odom.pose.covariance[21] = 1e6;
 	odom.pose.covariance[28] = 1e6;
 	odom.pose.covariance[35] = 1e3;
-	odom.twist.covariance[0] = 1e-3;
-	odom.twist.covariance[7] = 1e-3;
+	odom.twist.covariance[0] = twistCovariance(wheelDataStale, 1e-3, staleTwistCovariance);
+	odom.twist.covariance[7] = twistCovariance(wheelDataStale, 1e-3, staleTwistCovariance);
 	odom.twist.covariance[8] = 0.0;
 	odom.twist.covariance[14] = 1e6;
 	odom.twist.covariance[21] = 1e6;
 	odom.twist.covariance[28] = 1e6;
-	odom.twist.covariance[35] = 1e3;
+	odom.twist.covariance[35] = twistCovariance(wheelDataStale, 1e3, staleTwistCovariance);
 	odom.pose.pose.position.x = odomx;
 	odom.pose.pose.position.y = odomy;
 	odom.pose.pose.position.z = 0.0;

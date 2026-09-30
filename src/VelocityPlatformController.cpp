@@ -44,9 +44,32 @@
 
 #include <kelo_tulip/VelocityPlatformController.h>
 #include <math.h>
+#include <algorithm>
 
 namespace kelo
 {
+
+    void VelocityPlatformController::setWheelActive(size_t wheel_index, bool active)
+    {
+        if (wheel_index >= wheel_active_.size() || wheel_active_[wheel_index] == active)
+        {
+            return;
+        }
+        wheel_active_[wheel_index] = active;
+        last_target_l_[wheel_index] = 0.0f;
+        last_target_r_[wheel_index] = 0.0f;
+        last_pivot_error_[wheel_index] = 0.0f;
+    }
+
+    void VelocityPlatformController::setCurrentShaping(const CurrentShapingConfig& config)
+    {
+        shaping_ = isValid(config) ? config : CurrentShapingConfig();
+        for (size_t i = 0; i < wheel_params_.size(); i++)
+        {
+            wheel_params_[i].pivot_kp = shaping_.pivotKp;
+            wheel_params_[i].max_pivot_error = shaping_.maxPivotError;
+        }
+    }
 
     VelocityPlatformController::VelocityPlatformController()
     {
@@ -90,6 +113,12 @@ namespace kelo
         unsigned int num_of_wheels = wheel_configs.size();
 
         wheel_params_.clear();
+        shaping_ = CurrentShapingConfig();
+        wheel_active_.assign(num_of_wheels, true);
+        last_target_l_.assign(num_of_wheels, 0.0f);
+        last_target_r_.assign(num_of_wheels, 0.0f);
+        last_pivot_error_.assign(num_of_wheels, 0.0f);
+        reorient_scale_ = 1.0f;
 
         for ( size_t i = 0; i < num_of_wheels; i++ )
         {
@@ -106,9 +135,9 @@ namespace kelo
             wheel_param.angular_to_linear_velocity = 0.5 * wheel_diameter;
             wheel_param.linear_to_angular_velocity = 1.0 / wheel_param.angular_to_linear_velocity;
             wheel_param.max_linear_velocity = velocity_limit * wheel_param.angular_to_linear_velocity;
-            wheel_param.pivot_kp = 0.2f;
+            wheel_param.pivot_kp = shaping_.pivotKp;
             wheel_param.wheel_diameter = wheel_diameter;
-            wheel_param.max_pivot_error = M_PI * 0.25f;
+            wheel_param.max_pivot_error = shaping_.maxPivotError;
 
             wheel_param.pivot_position.x = wheel_configs[i].x;
             wheel_param.pivot_position.y = wheel_configs[i].y;
@@ -161,6 +190,21 @@ namespace kelo
         }
         	
         float time_delta = (now - time_last_ramping).total_microseconds() / 1000000.0f;
+        time_last_ramping = now;
+        calculatePlatformRampedVelocities(time_delta);
+    }
+
+    void VelocityPlatformController::calculatePlatformRampedVelocities(float time_delta)
+    {
+        ramp_dt_ = time_delta;
+        if (time_delta > PAUSE_GAP_SEC)
+        {
+            /* the driver was paused: hubs are at rest, not where the last
+             * setpoint left them */
+            std::fill(last_target_l_.begin(), last_target_l_.end(), 0.0f);
+            std::fill(last_target_r_.begin(), last_target_r_.end(), 0.0f);
+            std::fill(last_pivot_error_.begin(), last_pivot_error_.end(), 0.0f);
+        }
 
         // velocity ramps
         if (platform_ramped_vel_.x >= 0) {
@@ -203,8 +247,6 @@ namespace kelo
         platform_ramped_vel_.x = Utils::clip(platform_ramped_vel_.x, platform_limits_.max_vel_linear, -platform_limits_.max_vel_linear);
         platform_ramped_vel_.y = Utils::clip(platform_ramped_vel_.y, platform_limits_.max_vel_linear, -platform_limits_.max_vel_linear);
         platform_ramped_vel_.a = Utils::clip(platform_ramped_vel_.a, platform_limits_.max_vel_angular, -platform_limits_.max_vel_angular);
-      	
-        time_last_ramping = now;
     }
 
     void VelocityPlatformController::calculateWheelTargetVelocity(
@@ -217,8 +259,12 @@ namespace kelo
          * If this is not done, then the wheels pivot to face front of platform
          * even when the platform is commanded zero velocity.
          */
-        if ( platform_ramped_vel_.x == 0 && platform_ramped_vel_.y == 0 && platform_ramped_vel_.a == 0 )
+        if ( !wheel_active_[wheel_index]
+             || (platform_ramped_vel_.x == 0 && platform_ramped_vel_.y == 0 && platform_ramped_vel_.a == 0) )
         {
+            last_target_l_[wheel_index] = 0.0f;
+            last_target_r_[wheel_index] = 0.0f;
+            last_pivot_error_[wheel_index] = 0.0f;
             target_ang_vel_l = 0.0f;
             target_ang_vel_r = 0.0f;
             return;
@@ -264,6 +310,15 @@ namespace kelo
         float pivot_error = Utils::getShortestAngle(target_pivot_angle,
                                                              pivot_angle);
 
+        /* re-orient first: judged by the worst caster of the previous pass, since
+         * the wheels are visited one by one */
+        last_pivot_error_[wheel_index] = std::isfinite(pivot_error) ? fabs(pivot_error) : 0.0f;
+        reorient_scale_ = reorientScale(*std::max_element(last_pivot_error_.begin(),
+                                                          last_pivot_error_.end()),
+                                        shaping_);
+
+        const float unclipped_pivot_error = pivot_error;
+
         /* limit pivot velocity */
         pivot_error = Utils::clip(pivot_error,
                                            wheel_param.max_pivot_error,
@@ -277,7 +332,8 @@ namespace kelo
         target_vel_vec_r.y = platform_ramped_vel_.y + (platform_ramped_vel_.a * position_r.x);
 
         /* differential correction speed to minimise pivot_error */
-        float delta_vel = pivot_error * wheel_param.pivot_kp;
+        float delta_vel = pivotCorrectionSpeed(pivot_error, shaping_);
+        const float legacy_delta_vel = legacyPivotCorrection(unclipped_pivot_error);
 
         /* target velocity of left wheel (dot product with unit pivot vector) */
         float vel_l = target_vel_vec_l.x * unit_pivot_vector.x
@@ -286,7 +342,7 @@ namespace kelo
         {
             vel_l *= -1;
         }
-        float target_vel_l = Utils::clip(vel_l + delta_vel,
+        float target_vel_l = Utils::clip(hubSetpoint(vel_l, delta_vel, legacy_delta_vel, reorient_scale_),
                                                   wheel_param.max_linear_velocity,
                                                   -wheel_param.max_linear_velocity);
 
@@ -297,13 +353,23 @@ namespace kelo
         {
             vel_r *= -1;
         }
-        float target_vel_r = Utils::clip(vel_r - delta_vel,
+        float target_vel_r = Utils::clip(hubSetpoint(vel_r, -delta_vel, -legacy_delta_vel, reorient_scale_),
                                                   wheel_param.max_linear_velocity,
                                                   -wheel_param.max_linear_velocity);
 
         /* convert from linear to angular velocity */
-        target_ang_vel_l = target_vel_l * wheel_param.linear_to_angular_velocity;
-        target_ang_vel_r = target_vel_r * wheel_param.linear_to_angular_velocity;
+        target_ang_vel_l = slewLimit(last_target_l_[wheel_index],
+                                     target_vel_l * wheel_param.linear_to_angular_velocity,
+                                     shaping_.slewRateRadPerSecSq,
+                                     std::min(ramp_dt_, SLEW_MAX_DT_SEC));
+        target_ang_vel_r = slewLimit(last_target_r_[wheel_index],
+                                     target_vel_r * wheel_param.linear_to_angular_velocity,
+                                     shaping_.slewRateRadPerSecSq,
+                                     std::min(ramp_dt_, SLEW_MAX_DT_SEC));
+        if ( !std::isfinite(target_ang_vel_l) ) target_ang_vel_l = 0.0f;
+        if ( !std::isfinite(target_ang_vel_r) ) target_ang_vel_r = 0.0f;
+        last_target_l_[wheel_index] = target_ang_vel_l;
+        last_target_r_[wheel_index] = target_ang_vel_r;
     }
 
     std::ostream& operator << (std::ostream &out, const VelocityPlatformController& controller)

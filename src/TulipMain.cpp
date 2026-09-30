@@ -42,10 +42,14 @@
  ******************************************************************************/
 
 #include "kelo_tulip/DriverLiveness.h"
+#include "kelo_tulip/EscDiagnosticsRos.h"
 #include "kelo_tulip/EtherCATMaster.h"
 #include "kelo_tulip/PlatformDriverROS.h"
 #include "kelo_tulip/modules/RobileMasterBatteryROS.h"
 #include "rclcpp/rclcpp.hpp"
+
+#include <algorithm>
+#include <cstdlib>
 
 // create and configure one module
 kelo::EtherCATModuleROS* createModule(rclcpp::Node::SharedPtr nh, std::string moduleType, std::string moduleName, std::string configTag) {
@@ -74,6 +78,33 @@ kelo::EtherCATModuleROS* createModule(rclcpp::Node::SharedPtr nh, std::string mo
 	return module;
 }
 
+// Where the black box dumps go when the launch names no directory. With no home
+// there is none: a shared, guessable directory is worse than no dumps.
+std::string defaultDumpDir() {
+	const char* rosHome = std::getenv("ROS_HOME");
+	const char* home = std::getenv("HOME");
+	if (rosHome && *rosHome)
+		return std::string(rosHome) + "/kelo_tulip/ethercat_dumps";
+	if (home && *home)
+		return std::string(home) + "/.ros/kelo_tulip/ethercat_dumps";
+	return "";
+}
+
+kelo::BlackBoxConfig readBlackBoxConfig(rclcpp::Node::SharedPtr nh) {
+	kelo::BlackBoxConfig config;
+	config.dir = nh->get_parameter("blackbox.dir").as_string();
+	if (config.dir.empty())
+		config.dir = defaultDumpDir();
+	config.historyS = nh->get_parameter("blackbox.history_s").as_double();
+	config.postTriggerS = nh->get_parameter("blackbox.post_trigger_s").as_double();
+	config.minIntervalS = nh->get_parameter("blackbox.min_interval_s").as_double();
+	config.maxFiles = static_cast<std::size_t>(std::max<int64_t>(0, nh->get_parameter("blackbox.max_files").as_int()));
+	config.maxTotalBytes =
+		static_cast<std::uint64_t>(std::max<int64_t>(0, nh->get_parameter("blackbox.max_total_mb").as_int())) *
+		1024ull * 1024ull;
+	return kelo::sanitizeBlackBoxConfig(config);
+}
+
 /*
 // step through all modules
 void stepModules(const rclcpp::TimerEvent&) {
@@ -92,6 +123,16 @@ int main (int argc, char** argv)
 	nh->declare_parameter("robile_master_battery_ethercat_number", 0);
 	nh->declare_parameter("device", "");
 	nh->declare_parameter("enable_ethercat_recovery", false);
+	// Last seconds of the 1 kHz loop, dumped to CSV on a communication error.
+	nh->declare_parameter("blackbox.enabled", true);
+	nh->declare_parameter("blackbox.dir", "");
+	nh->declare_parameter("blackbox.history_s", 2.0);
+	nh->declare_parameter("blackbox.post_trigger_s", 0.5);
+	nh->declare_parameter("blackbox.min_interval_s", 10.0);
+	nh->declare_parameter("blackbox.max_files", 100);
+	nh->declare_parameter("blackbox.max_total_mb", 256);
+	// ESC error counters per slave; 0 turns the read off.
+	nh->declare_parameter("ethercat_diagnostics_period_s", 5.0);
 
 	std::vector<kelo::EtherCATModuleROS*> rosModules;
 
@@ -137,6 +178,18 @@ int main (int argc, char** argv)
 		return -1;		
 	}
 
+	if (nh->get_parameter("blackbox.enabled").as_bool()) {
+		const kelo::BlackBoxConfig blackBoxConfig = readBlackBoxConfig(nh);
+		if (blackBoxConfig.dir.empty()) {
+			RCLCPP_ERROR(nh->get_logger(), "No blackbox.dir, ROS_HOME or HOME: EtherCAT black box is off");
+		} else {
+			master->enableBlackBox(blackBoxConfig);
+			RCLCPP_INFO(nh->get_logger(), "EtherCAT black box dumps to %s", blackBoxConfig.dir.c_str());
+		}
+	}
+	master->enableEscDiagnostics(nh->get_parameter("ethercat_diagnostics_period_s").as_double());
+	kelo::EscDiagnosticsPublisher escPublisher(nh, [master] { return master->escSnapshot(); });
+
 	// initialize EtherCAT
 	while (!master->initEthercat()) {
 		if (delayRetry == 0) {
@@ -164,6 +217,7 @@ int main (int argc, char** argv)
 		}
 
 		rclcpp::spin_some(nh);		
+		escPublisher.publishIfNew();
 		
 		for (size_t i = 0; i < rosModules.size(); i++)
 			rosModules[i]->step();
@@ -171,11 +225,12 @@ int main (int argc, char** argv)
 		rate.sleep();
 	}
 
-	// delete and close everything
+	// The master's loop steps the modules, so it stops (and flushes the black
+	// box) before they go.
+	delete master;
+
 	for (size_t i = 0; i < rosModules.size(); i++)
 		delete rosModules[i];
-
-	delete master;
 	
 	rclcpp::shutdown();
 	return exitStatus;

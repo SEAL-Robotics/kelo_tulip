@@ -47,6 +47,7 @@
 #include <memory>
 
 #include "kelo_tulip/CommandWatchdog.h"
+#include "kelo_tulip/OdometryFreshness.h"
 #include "kelo_tulip/EtherCATModuleROS.h"
 #include "kelo_tulip/PlatformDriver.h"
 #include "kelo_tulip/msg/kelo_drives_input.hpp"
@@ -97,18 +98,23 @@ public:
 	virtual EtherCATModule* getEtherCATModule();
 
 protected:
+	//! Period of the ROS loop in TulipMain.cpp (20 Hz).
+	static constexpr double LOOP_PERIOD_SEC = 0.05;
+
 	virtual kelo::PlatformDriver* createDriver();
 	
 	void readWheelModels();
 	void readWheelConfig();
 	void checkAndPublishSmartWheelStatus();
 	
+	double wheelAliasingLimitSec();
 	void initializeEncoderValue();
 	void calculateRobotVelocity(double& vx, double& vy, double& va, double& displacement);
 	void calculateRobotPose(double vx, double vy, double va);
-	void calculateRobotVelocity2(double& vx, double& vy, double& va, double& displacement, double &dt);
+	// Velocities are zero while the wheel data is stale.
+	OdometryFreshnessTracker::Update calculateRobotVelocity2(double& vx, double& vy, double& va, double& displacement, double &dt);
 	void calculateRobotPose2(double vx, double vy, double va, double dt);
-	void publishOdometry(double vx, double vy, double va);
+	void publishOdometry(double vx, double vy, double va, bool wheelDataStale);
 	void createOdomToBaseLinkTransform(geometry_msgs::msg::TransformStamped& odom_trans);
 
 	void publishProcessDataInput();
@@ -160,7 +166,10 @@ protected:
 	std::vector<double> prev_left_enc;
 	std::vector<double> prev_right_enc;
 	std::vector<double> prev_pivot_enc;
-	std::vector<uint64_t> prev_ts;
+	std::unique_ptr<OdometryFreshnessTracker> freshnessTracker;
+	double staleTwistCovariance;
+	double encoderDeltaLimit;
+	double maxHeldGap;
 
 	double odomx;
 	double odomy;

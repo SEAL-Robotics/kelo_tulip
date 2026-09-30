@@ -62,6 +62,7 @@ extern "C" {
 #include "kelo_tulip/Utils.h"
 #include "kelo_tulip/WheelConfig.h"
 #include "kelo_tulip/WheelRecovery.h"
+#include "kelo_tulip/EthercatBlackBox.h"
 #include <boost/thread.hpp>
 #include <atomic>
 #include <chrono>
@@ -96,14 +97,6 @@ enum DriverError {
 	DRIVER_ERROR_SLIP = 0x2000
 };
 
-enum WheelState {
-	WHEEL_NORMAL_OPERATION  = 1,
-	WHEEL_FAILURE = 2, //permanent failure
-	WHEEL_STATUS_RECOVERY_SENDING_DISABLE = 3,
-	WHEEL_STATUS_RECOVERY_SENDING_ENABLE  = 4,
-	WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION = 5
-};
-
 class PlatformDriver : public EtherCATModule {
 public:
 	PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, const std::vector<WheelData>& wheelData);
@@ -113,6 +106,7 @@ public:
 
 	virtual bool initEtherCAT(ec_slavet* ecx_slaves, int ecx_slavecount);
 	virtual bool step();
+	virtual void setBlackBox(EthercatBlackBox* box) { blackBox = box; }
 	
 	virtual bool stepInit();
 	virtual bool stepReady();
@@ -137,6 +131,7 @@ public:
 	void setMaxvaacc(double x);
 	void setMaxvlindec(double x);
 	void setMaxvadec(double x);
+	void setCurrentShaping(const CurrentShapingConfig& config);
 	void setFactorAngleaccVlin(double x);
 	void setFractionVelTolerance(double x);
 	void setFractionFactor(double x);
@@ -164,6 +159,14 @@ protected:
 	virtual void doStop();
 	virtual void doControl();
 	void doWheelRecovery(unsigned int wheel);
+	void logRecoveryEvents(unsigned int wheel, unsigned int events);
+	bool wheelLinkUp(unsigned int wheel);
+	bool anyWheelHolding() const;
+	bool stepStateMachine();
+	void recordBlackBoxSample();
+	// Wall time since construction; only its steps feed the recovery clock.
+	virtual double nowMs() const;
+	void advanceRecoveryClock();
 	bool anyWheelFailed() const;
 	void applyWheelEnable(unsigned int wheel);
 
@@ -229,20 +232,24 @@ protected:
 	unsigned int maxInitResets;
 	unsigned int initTimeoutSteps;
 
-	//recovery behavior
-	// Monotonic: chrony steps the wall clock on this host.
+	// Recovery, one state machine per wheel. The clock is monotonic: chrony
+	// steps the wall clock on this host.
 	using RecoveryClock = std::chrono::steady_clock;
-	std::vector<WheelState> wheelState;
-	std::vector<unsigned int> recoveryAttempt;
-	std::vector<RecoveryClock::time_point> lastWheelStateEntry;
-	std::vector<RecoveryClock::time_point> lastRecoveryAttempt;
-	std::vector<RecoveryClock::time_point> lastNormalStatus;
-	unsigned int maxRecoveryAttempts;
-	double tRecoveryReenable;
-	double tRecoveryDisable;
-	double tRecoveryRetry;
-	double tRecoveryCounterReset;
-	double tLatchErrorStatus;
+	RecoveryClock::time_point clockStart;
+	// Advances by at most a few ms per step, so a stalled loop (a reinitialisation
+	// blocks it for seconds) does not age a link loss into a give-up.
+	double recoveryClockMs = 0.0;
+	double lastRealMs = 0.0;
+	WheelRecoveryConfig recoveryConfig;
+	std::vector<WheelRecoveryMachine> recoveryMachines;
+	std::vector<LinkMonitor> linkMonitors;
+	// A wheel that is not in normal operation makes the platform hold: every
+	// wheel's setpoint is ramped to zero until it is.
+	std::vector<bool> wheelHolding;
+	SetpointVectorSlew setpointSlew;
+	std::vector<float> wheelSetpoints;  // setpoint1, setpoint2 per wheel
+	float releaseStep;
+	EthercatBlackBox* blackBox = nullptr;
 
 private:
 	PlatformDriver(const PlatformDriver&);

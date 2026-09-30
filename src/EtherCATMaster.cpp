@@ -43,6 +43,7 @@
 
 #include "kelo_tulip/EtherCATMaster.h"
 #include <iostream>
+#include "kelo_tulip/RtLog.h"
 
 namespace kelo {
 
@@ -51,6 +52,8 @@ EtherCATMaster::EtherCATMaster(std::string device, std::vector<EtherCATModule*> 
 	, modules(modules)
 {
 	ethercatInitialized = false;
+	ethercatThread = nullptr;
+	ethercatCheckThread = nullptr;
 	threadPhase = 0;
 	pauseThreadMs = 0;
 	flagReconnectSlave = false;
@@ -84,6 +87,33 @@ EtherCATMaster::EtherCATMaster(std::string device, std::vector<EtherCATModule*> 
 }
 
 EtherCATMaster::~EtherCATMaster() {
+	// The loop calls into modules the caller frees next, and into the black
+	// box freed with this object: stop it first.
+	stopThread = true;
+	if (escDiagnostics)
+		escDiagnostics->stop();
+	for (boost::thread** thread : {&ethercatThread, &ethercatCheckThread}) {
+		if (*thread && (*thread)->joinable())
+			(*thread)->join();
+		delete *thread;
+		*thread = nullptr;
+	}
+	for (EtherCATModule* module : modules)
+		module->setBlackBox(nullptr);
+}
+
+void EtherCATMaster::enableBlackBox(const BlackBoxConfig& config) {
+	blackBox.reset(new EthercatBlackBox(config));
+	for (EtherCATModule* module : modules)
+		module->setBlackBox(blackBox.get());
+}
+
+void EtherCATMaster::enableEscDiagnostics(double periodS) {
+	escDiagnostics.reset(new EscDiagnostics(&ecx_context, periodS));
+}
+
+EscSnapshot EtherCATMaster::escSnapshot() const {
+	return escDiagnostics ? escDiagnostics->snapshot() : EscSnapshot();
 }
 
 EtherCATMaster::EtherCATMaster(const EtherCATMaster&) {
@@ -96,6 +126,7 @@ bool EtherCATMaster::initEthercat() {
 			return false;
 		}
 		std::cout << "Initializing EtherCAT on " << device << "\n";
+		portOpen = true;
 		
 		ethercatInitialized = true;
 	}
@@ -229,11 +260,18 @@ bool EtherCATMaster::initEthercat() {
 	}
 	sleep(1);
 	inOP = true;
+	RtLog::instance().start();
+	if (escDiagnostics)
+		escDiagnostics->start();
 
 	return true;
 }
 
 void EtherCATMaster::closeEthercat() {
+	// Module failure and reinitialisation both close; the second must not
+	// touch a descriptor number that may have been reused.
+	if (!portOpen.exchange(false))
+		return;
 	ecx_slave[0].state = EC_STATE_SAFE_OP;
 
 	// request SAFE_OP state for all slaves */
@@ -289,16 +327,26 @@ void EtherCATMaster::ethercatHandler() {
 		startTime = boost::posix_time::microsec_clock::local_time();
 
 		wkc = ecx_receive_processdata(&ecx_context, ethercatTimeout);
+		if (blackBox)
+			blackBox->setBusStatus(wkc, expectedWKC);
 
 		if (wkc != expectedWKC) {
-			if (!ethercatWkcError)
-				std::cout << "WKC error: expected " << expectedWKC << ", got " << wkc << std::endl;
+			if (!ethercatWkcError) {
+				RtLog::instance().pushf("WKC error: expected %d, got %d", expectedWKC, wkc);
+				if (blackBox)
+					blackBox->trigger(DumpReason::WkcError);
+			}
 			ethercatWkcError = true;
-		} else ethercatWkcError = false;
+		} else {
+			// The counters are read once the episode is over, off this thread.
+			if (ethercatWkcError && escDiagnostics)
+				escDiagnostics->requestPoll();
+			ethercatWkcError = false;
+		}
 		
 		if (wkc <= 0) {
 			if (communicationErrors == 0) {
-				std::cout << "Receiving data failed" << std::endl;
+				RtLog::instance().push("Receiving data failed");
 			}
 			communicationErrors++;
 		} else {
@@ -306,7 +354,7 @@ void EtherCATMaster::ethercatHandler() {
 		}
 
 		if (communicationErrors == maxCommunicationErrors) {
-			std::cout << "Lost EtherCAT connection" << std::endl;
+			RtLog::instance().push("Lost EtherCAT connection");
 		}
 
 		// check for slave timeout errors
@@ -319,7 +367,10 @@ void EtherCATMaster::ethercatHandler() {
 			modulesOK = modules[i]->step();
 
 		if (!modulesOK) {
-			std::cout << "EtherCAT module failed, stopping EtherCAT communication." << std::endl;
+			RtLog::instance().push("EtherCAT module failed, stopping EtherCAT communication.");
+			// The poller reads through the port that is about to close.
+			if (escDiagnostics)
+				escDiagnostics->stop();
 			closeEthercat();
 			stopThread = true;
 			break;
@@ -328,13 +379,13 @@ void EtherCATMaster::ethercatHandler() {
 		//send and receive data from ethercat
 		wkc2 = ecx_send_processdata(&ecx_context);
 		if (wkc2 == 0) {
-			std::cout << "Sending process data failed" << std::endl;
+			RtLog::instance().push("Sending process data failed");
 		}
 
 		if (ecx_iserror(&ecx_context)) {
 			ec_errort ec;
 			ecx_poperror(&ecx_context, &ec);
-			std::cout << "There is an error in the soem driver" << std::endl;
+			RtLog::instance().push("There is an error in the soem driver");
 		}
 		
 		step++;
@@ -398,6 +449,8 @@ void EtherCATMaster::ethercatCheck(void)
                      {
                         ecx_slave[slave].islost = TRUE;
                         printf("ERROR : slave %d lost\n",slave);
+                        if (blackBox)
+                           blackBox->trigger(DumpReason::SlaveLost);
                         /* zero input data for this slave */
                         if(ecx_slave[slave].Ibytes)
                         {
@@ -415,6 +468,8 @@ void EtherCATMaster::ethercatCheck(void)
                      {
                         ecx_slave[slave].islost = FALSE;
                         printf("MESSAGE : slave %d found and recovered\n",slave);
+                        if (escDiagnostics)
+                           escDiagnostics->requestPoll();
                      }
                   }
                   else
@@ -441,6 +496,9 @@ void EtherCATMaster::ethercatCheck(void)
 bool EtherCATMaster::reinitializeEthercat() {
 	std::cout << "Start Ethercat Reinitialization" << std::endl;
 	stopThread = true;
+	// The counters cannot be read while the port is closed.
+	if (escDiagnostics)
+		escDiagnostics->stop();
 	if (ethercatThread && ethercatThread->joinable()) {
 		ethercatThread->join();
 		delete ethercatThread;

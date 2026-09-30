@@ -59,8 +59,12 @@ extern "C" {
 }
 #include <boost/thread.hpp>
 #include <atomic>
+#include <memory>
 #include <string>
 #include <fstream>
+
+#include "kelo_tulip/EscDiagnostics.h"
+#include "kelo_tulip/EthercatBlackBox.h"
 
 namespace kelo {
 
@@ -68,6 +72,13 @@ class EtherCATMaster {
 public:
 	EtherCATMaster(std::string device, std::vector<EtherCATModule*> modules);
 	virtual ~EtherCATMaster();
+
+	// Both before initEthercat(). The black box dumps the last seconds of the
+	// loop to CSV on a communication error; the poller reads every slave's
+	// ESC error counters at the given period and after each error episode.
+	void enableBlackBox(const BlackBoxConfig& config);
+	void enableEscDiagnostics(double periodS);
+	EscSnapshot escSnapshot() const;
 
 	bool initEthercat();
 	void closeEthercat();
@@ -120,9 +131,13 @@ protected:
 	volatile bool ethercatWkcError;
 	volatile bool flagReconnectSlave;
 
+	// Set while the port is open; closeEthercat() is a no-op otherwise.
+	std::atomic<bool> portOpen{false};
 	std::atomic<bool> reinitializeFlag{false};
 	int maxReinitializationAttempt;
 	std::vector<EtherCATModule*> modules;
+	std::unique_ptr<EthercatBlackBox> blackBox;
+	std::unique_ptr<EscDiagnostics> escDiagnostics;
 
 private:
 	EtherCATMaster(const EtherCATMaster&);

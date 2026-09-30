@@ -42,7 +42,9 @@
  ******************************************************************************/
 
 #include "kelo_tulip/PlatformDriver.h"
+#include <algorithm>
 #include <iostream>
+#include "kelo_tulip/RtLog.h"
 
 extern "C" {
 #include "kelo_tulip/soem/ethercat.h"
@@ -57,6 +59,15 @@ extern "C" {
 }
 
 namespace kelo {
+
+namespace {
+// Per 1 ms cycle. The wheel setpoints of a holding platform ramp down this
+// fast, 50 rad/s^2: a full-speed wheel (35 rad/s) is at rest in 0.7 s and a
+// typical one in about 0.1 s, since a wheel is disabled and the platform must
+// not keep driving on the rest. The ramp keeps a stop from being an instantaneous
+// zero; the drive's current limit bounds the braking torque either way.
+constexpr float kHoldSetpointStep = 0.05f;
+}  // namespace
 
 PlatformDriver::PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, const std::vector<WheelData>& wheelData)
 	: wheelConfigs(wheelConfigs)
@@ -117,19 +128,14 @@ PlatformDriver::PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, con
 	maxInitResets = 3;
 	initTimeoutSteps = 500;
 
-	//recovery behavior
-	const RecoveryClock::time_point now = RecoveryClock::now();
-	wheelState.resize(nWheels, WHEEL_NORMAL_OPERATION);
-	recoveryAttempt.resize(nWheels, 0);
-	lastWheelStateEntry.resize(nWheels, now);
-	lastRecoveryAttempt.resize(nWheels, now);
-	lastNormalStatus.resize(nWheels, now);
-	maxRecoveryAttempts = 10;
-	tRecoveryDisable = 10.0; //milliseconds
-	tRecoveryReenable = 1.0; //milliseconds
-	tRecoveryRetry = 100.0; //milliseconds
-	tRecoveryCounterReset = 30000.0; //milliseconds
-	tLatchErrorStatus = 10.0; //milliseconds
+	clockStart = RecoveryClock::now();
+	lastRealMs = nowMs();
+	recoveryMachines.assign(nWheels, WheelRecoveryMachine(recoveryConfig, recoveryClockMs));
+	linkMonitors.resize(nWheels);
+	wheelHolding.resize(nWheels, false);
+	setpointSlew.resize(2 * nWheels);
+	wheelSetpoints.assign(2 * nWheels, 0.0f);
+	releaseStep = kHoldSetpointStep;
 }
 
 PlatformDriver::~PlatformDriver() {
@@ -167,6 +173,12 @@ bool PlatformDriver::initEtherCAT(ec_slavet* ecx_slaves, int ecx_slavecount) {
 }
 
 bool PlatformDriver::step() {
+	const bool keepRunning = stepStateMachine();
+	recordBlackBoxSample();
+	return keepRunning;
+}
+
+bool PlatformDriver::stepStateMachine() {
 	stepCount++;
 	lastProcessData = processData;
 	for (int i = 0; i < nWheels; i++)
@@ -204,7 +216,7 @@ bool PlatformDriver::stepInit() {
 	
 	if (ready) {
 		state = DRIVER_STATE_READY;
-		std::cout << "PlatformDriver from INIT to READY" << std::endl;
+		RtLog::instance().push("PlatformDriver from INIT to READY");
 		resetErrorFlags();
 	}
 
@@ -212,8 +224,8 @@ bool PlatformDriver::stepInit() {
 		initTimeoutSteps, initResets, maxInitResets)) {
 		case InitAction::ResetWheels:
 			initResets++;
-			std::cout << "Wheels not ready after " << initTimeoutSteps << " steps, re-running the start sequence ("
-				<< initResets << "/" << maxInitResets << ")." << std::endl;
+			RtLog::instance().pushf("Wheels not ready after %u steps, re-running the start sequence (%u/%u).",
+				initTimeoutSteps, initResets, maxInitResets);
 			// doStop sends disable again until initCounter passes initTolerance, then enable.
 			initCounter = 0;
 			initAttemptStartStep = stepCount;
@@ -222,7 +234,7 @@ bool PlatformDriver::stepInit() {
 				abs_sum_encoder[wheel].assign(2, 0.0);
 			break;
 		case InitAction::GiveUp:
-			std::cout << "Stopping platform driver, because wheels don't become ready." << std::endl;
+			RtLog::instance().push("Stopping platform driver, because wheels don't become ready.");
 			return false;
 		case InitAction::Wait:
 			break;
@@ -237,10 +249,13 @@ bool PlatformDriver::stepReady() {
 	if (!statusError) {
 		if (canChangeActive) {
 			state = DRIVER_STATE_ACTIVE;
-			std::cout << "PlatformDriver from READY to ACTIVE" << std::endl;
+			// Recovery has not been watching until now: start its latch clock here.
+			lastRealMs = nowMs();
+			recoveryMachines.assign(nWheels, WheelRecoveryMachine(recoveryConfig, recoveryClockMs));
+			RtLog::instance().push("PlatformDriver from READY to ACTIVE");
 		}
 		else if (!showedMessageChangeActive) {
-			std::cout << "platform driver is ready, but waiting for signal to become active." << std::endl;
+			RtLog::instance().push("platform driver is ready, but waiting for signal to become active.");
 			showedMessageChangeActive = true;
 		}		
 	}
@@ -253,7 +268,7 @@ bool PlatformDriver::stepActive() {
 	// A wheel recovery gave up on is disabled; driving on the others is not
 	// safe, so stop EtherCAT and let the stack restart.
 	if (anyWheelFailed()) {
-		std::cout << "Stopping platform driver, because a wheel could not be recovered." << std::endl;
+		RtLog::instance().push("Stopping platform driver, because a wheel could not be recovered.");
 		return false;
 	}
 	return true;
@@ -261,11 +276,12 @@ bool PlatformDriver::stepActive() {
 
 void PlatformDriver::applyWheelEnable(unsigned int wheel) {
 	wheelEnabled[wheel] = effectiveWheelEnable(operatorEnable[wheel].load(), recoveryAllowsEnable[wheel]);
+	velocityPlatformController.setWheelActive(wheel, wheelEnabled[wheel]);
 }
 
 bool PlatformDriver::anyWheelFailed() const {
 	for (int i = 0; i < nWheels; i++)
-		if (wheelState[i] == WHEEL_FAILURE)
+		if (recoveryMachines[i].failed())
 			return true;
 	return false;
 }
@@ -324,6 +340,11 @@ void PlatformDriver::setMaxvadec(double x) {
 	velocityPlatformController.setPlatformMaxAngDeceleration(x);
 }
 
+void PlatformDriver::setCurrentShaping(const CurrentShapingConfig& config) {
+	velocityPlatformController.setCurrentShaping(config);
+	releaseStep = releaseStepPerCycle(config.slewRateRadPerSecSq, kHoldSetpointStep);
+}
+
 void PlatformDriver::reconnectSlave(int slave) {
 	if(slave >= 0) flagReconnectSlave = true;
 }
@@ -379,7 +400,7 @@ void PlatformDriver::updateStatusError() {
 			int s1 = processData[i].status1;
 			int s2 = processData[i].status2;		
 			if (!statusError) {
-				std::cout << "Status error: wheel=" << i << ", status1=" << s1 << ", status2=" << s2 << std::endl;
+				RtLog::instance().pushf("Status error: wheel=%d, status1=%d, status2=%d", i, s1, s2);
 				statusError = true;
 			}
 		}
@@ -388,7 +409,7 @@ void PlatformDriver::updateStatusError() {
 			int s1 = processData[i].status1;
 			int s2 = processData[i].status2;		
 			if (!statusError) {
-				std::cout << "Wheel got disabled: wheel=" << i << ", status1=" << s1 << ", status2=" << s2 << std::endl;
+				RtLog::instance().pushf("Wheel got disabled: wheel=%d, status1=%d, status2=%d", i, s1, s2);
 				statusError = true;
 			}
 		}
@@ -556,6 +577,7 @@ void PlatformDriver::doStop() {
 
 		setWheelProcessData(i, &rxdata);
 	}
+	setpointSlew.reset();
 }
 
 void PlatformDriver::doControl() {
@@ -568,22 +590,18 @@ void PlatformDriver::doControl() {
 	// update desired velocity of platform, based on target velocity and velocity ramps
 	velocityPlatformController.calculatePlatformRampedVelocities();
 
-	for (int i = 0; i < nWheels; i++) {
+	advanceRecoveryClock();
+	for (int i = 0; i < nWheels; i++)
 		doWheelRecovery(i);
+	// A wheel that is recovering or whose slave is gone makes the platform
+	// stop: the rest keep no purpose driving alone. Odometry reads zero
+	// meanwhile for a lost slave (its inputs are zeroed, so its timestamp is
+	// stale); that is accepted. On give-up stepActive ends the loop before the
+	// ramp completes, which the drive's current limit and the restart cover.
+	const bool hold = anyWheelHolding();
 
-		if (wheelEnabled[i])
-			rxdata.command1 = COM1_ENABLE1 | COM1_ENABLE2 | COM1_MODE_VELOCITY;
-		else
-			rxdata.command1 = COM1_MODE_VELOCITY;
-		
-		rxdata.command2 = COM2_MODE_VELOCITY;
-		rxdata.limit1_p = wheelConfigs[i].model.currentlimit;
-		rxdata.limit1_n = -wheelConfigs[i].model.currentlimit;
-		rxdata.limit2_p = wheelConfigs[i].model.currentlimit;
-		rxdata.limit2_n = -wheelConfigs[i].model.currentlimit;
-
+	for (int i = 0; i < nWheels; i++) {
 		txpdo1_t* wheel_data = getWheelProcessData(i);
-
 		float setpoint1, setpoint2;
 
 		/* calculate wheel target velocity */
@@ -602,114 +620,144 @@ void PlatformDriver::doControl() {
 		}
 
 		/* avoid sending very large values */
-		setpoint1 = Utils::clip(setpoint1, wheelsetpointmax, -wheelsetpointmax);
-		setpoint2 = Utils::clip(setpoint2, wheelsetpointmax, -wheelsetpointmax);
+		wheelSetpoints[2 * i] = Utils::clip(setpoint1, wheelsetpointmax, -wheelsetpointmax);
+		wheelSetpoints[2 * i + 1] = Utils::clip(setpoint2, wheelsetpointmax, -wheelsetpointmax);
+	}
+
+	/* ramp all wheels to zero together while any wheel is recovering, never cut */
+	setpointSlew.step(wheelSetpoints.data(), hold, kHoldSetpointStep, releaseStep, wheelSetpoints.data());
+
+	for (int i = 0; i < nWheels; i++) {
+		if (wheelEnabled[i])
+			rxdata.command1 = COM1_ENABLE1 | COM1_ENABLE2 | COM1_MODE_VELOCITY;
+		else
+			rxdata.command1 = COM1_MODE_VELOCITY;
+
+		rxdata.command2 = COM2_MODE_VELOCITY;
+		rxdata.limit1_p = wheelConfigs[i].model.currentlimit;
+		rxdata.limit1_n = -wheelConfigs[i].model.currentlimit;
+		rxdata.limit2_p = wheelConfigs[i].model.currentlimit;
+		rxdata.limit2_n = -wheelConfigs[i].model.currentlimit;
 
 		/* send calculated target velocity values to EtherCAT */
-		rxdata.setpoint1 = setpoint1;
-		rxdata.setpoint2 = setpoint2;
-		
+		rxdata.setpoint1 = wheelSetpoints[2 * i];
+		rxdata.setpoint2 = wheelSetpoints[2 * i + 1];
+
 		setWheelProcessData(i, &rxdata);
 	}
 }
 
+void PlatformDriver::advanceRecoveryClock() {
+	constexpr double kMaxStepMs = 5.0;
+	const double real = nowMs();
+	recoveryClockMs += std::min(std::max(real - lastRealMs, 0.0), kMaxStepMs);
+	lastRealMs = real;
+}
+
+double PlatformDriver::nowMs() const {
+	return std::chrono::duration<double, std::milli>(RecoveryClock::now() - clockStart).count();
+}
+
+bool PlatformDriver::wheelLinkUp(unsigned int wheel) {
+	if (!ecx_slaves)
+		return true;
+	const ec_slavet& slave = ecx_slaves[wheelConfigs[wheel].ethercatNumber];
+	return linkMonitors[wheel].update(recoveryClockMs, slave.islost != FALSE, slave.state == EC_STATE_OPERATIONAL);
+}
+
+bool PlatformDriver::anyWheelHolding() const {
+	for (int i = 0; i < nWheels; i++)
+		if (wheelHolding[i])
+			return true;
+	return false;
+}
+
 void PlatformDriver::doWheelRecovery(unsigned int wheel) {
-	const RecoveryClock::time_point now = RecoveryClock::now();
-	const auto elapsedMs = [&now](RecoveryClock::time_point since) {
-		return std::chrono::duration<double, std::milli>(now - since).count();
-	};
-	double tStateMs = elapsedMs(lastWheelStateEntry[wheel]);
-	double tLastRecoveryMs = elapsedMs(lastRecoveryAttempt[wheel]);
-	double tErrorDetectionMs = elapsedMs(lastNormalStatus[wheel]);
 	const bool operatorWants = operatorEnable[wheel].load();
-	const bool needsRecovery =
-		wheelNeedsRecovery(processData[wheel].status1, processData[wheel].status2, operatorWants);
+	const txpdo1_t& data = processData[wheel];
+	const WheelRecoveryMachine::Input input{recoveryClockMs, operatorWants,
+		wheelNeedsRecovery(data.status1, data.status2, operatorWants), wheelLinkUp(wheel),
+		wheelStatusSane(data.status1)};
 
-	const bool recovering = wheelState[wheel] == WHEEL_STATUS_RECOVERY_SENDING_DISABLE ||
-		wheelState[wheel] == WHEEL_STATUS_RECOVERY_SENDING_ENABLE ||
-		wheelState[wheel] == WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION;
-	if (recovering && !operatorWants) {
-		std::cout << "Wheel " << wheel << " recovery aborted: wheel disabled by operator" << std::endl;
-		wheelState[wheel] = WHEEL_NORMAL_OPERATION;
-		recoveryAllowsEnable[wheel] = true;
-		lastWheelStateEntry[wheel] = now;
-	}
-
-	switch (wheelState[wheel]) {
-		case WHEEL_NORMAL_OPERATION:
-			if (needsRecovery) {
-				if (tErrorDetectionMs > tLatchErrorStatus) {
-					recoveryAttempt[wheel]++;
-					if(recoveryAttempt[wheel] <= maxRecoveryAttempts) {
-						std::cout << "Start wheel " << wheel << " recovery" << std::endl;
-						wheelState[wheel] = WHEEL_STATUS_RECOVERY_SENDING_DISABLE; // state in next cycle
-						lastWheelStateEntry[wheel] = now;
-						lastRecoveryAttempt[wheel] = now;
-					} else {
-						std::cout << "Wheel " << wheel << " could not be recovered. Stopping operation" << std::endl;
-						wheelState[wheel] = WHEEL_FAILURE;
-						recoveryAllowsEnable[wheel] = false;
-						lastWheelStateEntry[wheel] = now;
-					}
-				}
-			} else {
-				lastNormalStatus[wheel] = now;
-			}
-
-			/*
-			 * Reset the number of attempts after a certain duration of normal operation.
-			 * This is a form of error escalation.
-			 */
-			if(tLastRecoveryMs > tRecoveryCounterReset) {
-				if (recoveryAttempt[wheel] > 0) {
-					std::cout << "Wheel " << wheel << " recovery attempts are reset to 0." << std::endl;
-					recoveryAttempt[wheel] = 0;
-				}
-			}
-			break;
-
-		case WHEEL_FAILURE:
-			recoveryAllowsEnable[wheel] = false;
-			break;
-
-		case WHEEL_STATUS_RECOVERY_SENDING_DISABLE:
-			recoveryAllowsEnable[wheel] = false;
-
-			if(tStateMs > tRecoveryDisable) {
-				wheelState[wheel] = WHEEL_STATUS_RECOVERY_SENDING_ENABLE;
-				lastWheelStateEntry[wheel] = now;
-			}
-			break;
-
-		case WHEEL_STATUS_RECOVERY_SENDING_ENABLE:
-			recoveryAllowsEnable[wheel] = true;
-
-			if(tStateMs > tRecoveryReenable) {
-				wheelState[wheel] = WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION;
-				lastWheelStateEntry[wheel] = now;
-			}
-			break;
-
-		case WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION:
-			if (needsRecovery) {
-				if(tStateMs > tRecoveryRetry)
-				{
-					std::cout << "Wheel " << wheel << " recovery failed" << std::endl;
-					wheelState[wheel] = WHEEL_NORMAL_OPERATION;
-					lastWheelStateEntry[wheel]  = now;
-				}
-			} else {
-				std::cout << "Wheel " << wheel << " recovery successful" << std::endl;
-				wheelState[wheel] = WHEEL_NORMAL_OPERATION;
-				lastWheelStateEntry[wheel] = now;
-			}
-			break;
-
-		default:
-			break;
-	}
-
+	const WheelRecoveryMachine::Output out = recoveryMachines[wheel].step(input);
+	recoveryAllowsEnable[wheel] = out.allowsEnable;
+	wheelHolding[wheel] = out.holdAtZero;
+	logRecoveryEvents(wheel, out.events);
 	applyWheelEnable(wheel);
+}
+
+// Runs on the EtherCAT thread: lines go to the RtLog, never to stdout.
+void PlatformDriver::logRecoveryEvents(unsigned int wheel, unsigned int events) {
+	if (events == 0)
+		return;
+	const auto has = [events](RecoveryEvent event) { return (events & event) != 0; };
+	const txpdo1_t& data = processData[wheel];
+	const int slave = wheelConfigs[wheel].ethercatNumber;
+	RtLog& log = RtLog::instance();
+	const unsigned int w = wheel;
+
+	if (has(RECOVERY_EVENT_ABORTED_BY_OPERATOR))
+		log.pushf("Wheel %u recovery aborted: wheel disabled by operator", w);
+	if (has(RECOVERY_EVENT_LINK_LOST))
+		log.pushf("Wheel %u (slave %d) is not answering: holding all wheels, waiting up to %.0f ms for it", w, slave,
+			recoveryConfig.linkLossWindowMs);
+	if (has(RECOVERY_EVENT_LINK_RESTORED))
+		log.pushf("Wheel %u (slave %d) answers again: status1=%u, status2=%u", w, slave, data.status1, data.status2);
+	if (has(RECOVERY_EVENT_STARTED))
+		log.pushf("Start wheel %u recovery", w);
+	if (has(RECOVERY_EVENT_SUCCEEDED))
+		log.pushf("Wheel %u recovery successful", w);
+	if (has(RECOVERY_EVENT_ATTEMPT_FAILED))
+		log.pushf("Wheel %u recovery failed", w);
+	if (has(RECOVERY_EVENT_ATTEMPTS_RESET))
+		log.pushf("Wheel %u recovery attempts are reset to 0.", w);
+	if (has(RECOVERY_EVENT_LINK_LOSS_TIMEOUT))
+		log.pushf("Wheel %u (slave %d) did not answer within %.0f ms", w, slave, recoveryConfig.linkLossWindowMs);
+	if (has(RECOVERY_EVENT_GAVE_UP))
+		log.pushf("Wheel %u could not be recovered. Stopping operation (status1=%u, status2=%u)", w, data.status1,
+			data.status2);
+
+	if (blackBox) {
+		if (has(RECOVERY_EVENT_GAVE_UP))
+			blackBox->trigger(DumpReason::WheelFailed);
+		else if (has(RECOVERY_EVENT_STARTED) || has(RECOVERY_EVENT_LINK_LOST))
+			blackBox->trigger(DumpReason::WheelRecovery);
+	}
+}
+
+void PlatformDriver::recordBlackBoxSample() {
+	if (!blackBox || !ecx_slaves)
+		return;
+	CycleSample sample{};
+	sample.cycle = static_cast<std::uint64_t>(stepCount);
+	sample.monotonicNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	sample.wkc = blackBox->wkc();
+	sample.expectedWkc = blackBox->expectedWkc();
+	sample.driverState = static_cast<std::uint8_t>(state);
+	const int recorded = std::min<int>(nWheels, kMaxBlackBoxWheels);
+	sample.wheelCount = static_cast<std::uint8_t>(recorded);
+	for (int i = 0; i < recorded; i++) {
+		const int slave = wheelConfigs[i].ethercatNumber;
+		const txpdo1_t& in = *reinterpret_cast<const txpdo1_t*>(ecx_slaves[slave].inputs);
+		const rxpdo1_t& out = *reinterpret_cast<const rxpdo1_t*>(ecx_slaves[slave].outputs);
+		WheelSample& w = sample.wheels[i];
+		w.sensorTs = in.sensor_ts;
+		w.voltageBus = in.voltage_bus;
+		w.currentIn = in.current_in;
+		w.current1q = in.current_1_q;
+		w.current2q = in.current_2_q;
+		w.status1 = in.status1;
+		w.status2 = in.status2;
+		w.command1 = out.command1;
+		w.setpoint1 = out.setpoint1;
+		w.setpoint2 = out.setpoint2;
+		w.limit1p = out.limit1_p;
+		w.limit2p = out.limit2_p;
+		w.wheelState = static_cast<std::uint8_t>(recoveryMachines[i].state());
+		w.flags = (ecx_slaves[slave].islost ? 0 : kWheelFlagLinkUp) | (wheelEnabled[i] ? kWheelFlagEnabled : 0);
+	}
+	blackBox->record(sample);
 }
 
 

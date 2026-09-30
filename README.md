@@ -11,11 +11,42 @@
 > - KELOdrive V2 automatic wheel recovery that never re-enables a wheel disabled
 >   through `setWheelsEnable`, disables a wheel it gives up on, and uses a
 >   monotonic clock;
+> - a slave that stops answering for a few seconds is waited for, not retried
+>   away: recovery spends no attempt while it is gone, holds every wheel at
+>   zero (ramped) and re-enables it once it looks sane; a drive that stays in
+>   error, or drops out again and again, is still given up;
+> - EtherCAT diagnostics: the ESC error counters per slave and a CSV dump of
+>   the last seconds of the 1 kHz loop on a communication error;
 > - INIT re-runs the drive start sequence up to 3 times before giving up;
 > - `platform_driver` exits (non-zero) once its EtherCAT loop has stopped, so a
 >   process supervisor can restart it instead of it idling with dead drives.
 >
 > Licensing is unchanged from upstream: see [LICENSE](LICENSE).
+
+## EtherCAT diagnostics
+
+`platform_driver` reads every slave's ESC error counters (registers
+0x0300-0x0313, read-only) every `ethercat_diagnostics_period_s` (5, 0 = off)
+and right after a communication error ends, from a thread of its own. Changes
+are logged as `[ecat-diag] slave N: rx_error[p0] +3`, and each read is
+published on `~/ethercat_diagnostics` (`diagnostic_msgs/DiagnosticArray`, one
+status per slave; `rx_error_pN` etc. are the absolute counters, `delta_*` what
+grew since the previous read). A counter that grows on one port points at the
+cable segment behind that port. Counters saturate at 255 and restart when a
+slave is power-cycled.
+
+A black box keeps the last `blackbox.history_s` (2) seconds of the loop, per
+wheel: `sensor_ts`, `voltage_bus`, `current_in`, `status1`, `status2`, the
+commanded enable, setpoints and current limits, measured iq, plus the WKC. On a
+WKC error, a lost slave or a wheel recovery it writes
+`ecat_<date>-<time>_<n>_<reason>.csv` into `blackbox.dir` (default
+`$ROS_HOME/kelo_tulip/ethercat_dumps`), `blackbox.post_trigger_s` (0.5) after
+the trigger; `t_ms` is relative to the row with `trigger=1`. Dumps are limited
+to one per `blackbox.min_interval_s` (10, the first one kept); a wheel giving up
+is never suppressed. Disk use is bounded by `blackbox.max_files` (100) and
+`blackbox.max_total_mb` (256), oldest files deleted first. `blackbox.enabled:
+false` turns it off. The 1 kHz thread only copies into a preallocated ring and
+sets atomics; a writer thread does the file I/O.
 
 This package contains the *KELO Tulip* software. This software takes a velocity vector for the overall platform and converts it to commands for the individual KELO Drives of the platform. It implements an EtherCAT master to communicate with the KELO Drives and provides a simple velocity controller that can be used on real robots as well as for simulation.
 

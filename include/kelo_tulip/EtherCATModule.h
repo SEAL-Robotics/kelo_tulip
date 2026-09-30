@@ -53,6 +53,8 @@ extern "C" {
 
 namespace kelo {
 
+class EthercatBlackBox;
+
 class EtherCATModule {
 public:
 	EtherCATModule();
@@ -61,6 +63,10 @@ public:
 	virtual bool initEtherCAT(ec_slavet* ecx_slaves, int ecx_slavecount) = 0;
 	virtual bool initEtherCAT2(ecx_contextt* ecx_context, int ecx_slavecount) = 0;
 	virtual bool step() = 0;
+
+	// Called by the master before the loop starts; the module then records
+	// into the box from the EtherCAT thread. Modules that record nothing ignore it.
+	virtual void setBlackBox(EthercatBlackBox*) {}
 };
 
 } // namespace kelp

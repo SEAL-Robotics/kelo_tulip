@@ -187,10 +187,18 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary)
  */
 int ecx_closenic(ecx_portt *port)
 {
+   /* A closed handle is forgotten: a second close must not hit an fd number
+    * that has been handed to something else since. */
    if (port->sockhandle >= 0)
+   {
       close(port->sockhandle);
+      port->sockhandle = -1;
+   }
    if ((port->redport) && (port->redport->sockhandle >= 0))
+   {
       close(port->redport->sockhandle);
+      port->redport->sockhandle = -1;
+   }
 
    return 0;
 }
