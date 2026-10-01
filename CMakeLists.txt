@@ -59,9 +59,11 @@ include_directories(
 	${INCLUDE_DIRS}
 )
 
-# Optionally apply cap_net_raw+ep permissions to binary. Requires root previleges.
-# Use sudo as default. Still, allow to be configured as environment veriable.
-OPTION(USE_SETCAP "Set permissions to access ethernet interface without sudo" ON)
+# Optionally apply cap_sys_nice,cap_net_raw+ep to the installed binary and add
+# an ld.so.conf entry, both with sudo. Off by default: a plain build must never
+# run sudo or write to /etc. Enable with -DUSE_SETCAP=ON, or set the
+# capabilities by hand after installing (see README).
+OPTION(USE_SETCAP "Set permissions to access ethernet interface without sudo" OFF)
 IF("$ENV{SUDO_COMMAND}" STREQUAL "")
 	SET(SUDO_COMMAND sudo)				# default = sudo
 ELSE("$ENV{SUDO_COMMAND}" STREQUAL "")

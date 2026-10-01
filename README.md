@@ -4,7 +4,19 @@
 > [kelo-robotics/kelo_tulip](https://github.com/kelo-robotics/kelo_tulip) for
 > ROS 2 Jazzy. It tracks the upstream ROS 2 feature branches and adds, on top:
 >
-> - a `/cmd_vel` watchdog (`cmd_vel_timeout`): stale commands ramp the platform to zero;
+> - a `/cmd_vel` watchdog (`cmd_vel_timeout`), enforced in the 1 kHz EtherCAT
+>   cycle itself: stale commands ramp the platform to zero even when the ROS
+>   executor stalls;
+> - an orderly exit (SIGINT, SIGTERM, or a wheel that cannot be recovered)
+>   ramps the platform to zero, holds zero until the hubs are still, then
+>   disables the drives and releases the bus, bounded by `stop_timeout`;
+> - all control timing (ramps, cycle timing, watchdogs) is on a monotonic
+>   clock, and a ramp time step is clamped, so a wall-clock step cannot
+>   command motion;
+> - every limit, timeout and wheel model is validated at start-up: an invalid
+>   value or an unknown wheel model is fatal, never a fallback;
+> - a NaN or Inf velocity command is a stop at every layer and never reaches
+>   the drives;
 > - the joypad no longer drives the wheels; `/cmd_vel` is the only velocity input;
 > - configurable `odom_frame` / `base_frame`, and `publish_tf` (default off);
 > - the EtherCAT thread really runs with `SCHED_FIFO`;
@@ -77,16 +89,28 @@ cd ..
 colcon build
 ~~~
 
+The driver needs raw network access and a real-time priority. A plain build
+does not grant them: `USE_SETCAP` is off by default, so a build never runs
+`sudo` or writes to `/etc`. Grant the capabilities after installing:
+
+~~~ sh
+sudo setcap cap_sys_nice,cap_net_raw+ep install/lib/kelo_tulip/platform_driver
+~~~
+
+A binary with file capabilities ignores `LD_LIBRARY_PATH`, so the ROS and
+workspace library directories must also be listed in `/etc/ld.so.conf.d`.
+`-DUSE_SETCAP=ON` does both at install time, with `sudo`.
+
 The unit tests (gtest) run with:
 
 ~~~ sh
-colcon build --packages-select kelo_tulip --cmake-args -DUSE_SETCAP=OFF
+colcon build --packages-select kelo_tulip
 colcon test --packages-select kelo_tulip
 colcon test-result --verbose
 ~~~
 
-`-DUSE_SETCAP=OFF` skips the install step that grants the driver its network
-capabilities with `sudo setcap`; grant them separately on the robot.
+The tests pin their own DDS domain (98) and localhost-only discovery, so they
+never talk to a robot on the same network.
 
 ## Usage
 ### Starting the program
@@ -175,7 +199,27 @@ The explanation of the parameters are as follows:
 - `vlin_acc_max`: maximum linear acceleration in m/s^2
 - `vlin_dec_max`: maximum linear deceleration in m/s^2
 - `va_acc_max`: maximum angular acceleration in rad/s^2
-- `va_dec_max`: minimum angular acceleration in rad/s^2
+- `va_dec_max`: maximum angular deceleration in rad/s^2
+
+On an orderly exit the driver stops the platform by itself:
+
+```
+stop_vlin_dec: 0.8
+stop_va_dec: 0.8
+stop_timeout: 3.0
+```
+
+- `stop_vlin_dec`, `stop_va_dec`: deceleration of that ramp, never above
+  `vlin_dec_max` / `va_dec_max`
+- `stop_timeout`: seconds from the request until the drives are disabled
+  whatever the platform does, in [0.5, 5]; it must exceed the time a stop
+  from `vlin_max` / `va_max` takes by 0.5 s. A launch that SIGKILLs the
+  driver sooner than `stop_timeout` + 1 s after its SIGINT cuts the ramp
+
+Every limit must be finite and positive and within physical bounds
+(`ParameterValidation.h`); every wheel must name a model in
+`wheel_models.list` and have a unique `ethercat_number` from 1. The driver
+refuses to start otherwise.
 
 ### ROS Interfaces
 
@@ -185,7 +229,7 @@ Currently the kelo_tulip software uses ROS as a middleware, subscribing resp. pu
 
 This topic accepts [`geometry_msgs/Twist`](https://docs.ros2.org/foxy/api/geometry_msgs/msg/Twist.html) messages. Any motion software that creates a velocity vector for the platform and publishes `geometry_msgs/Twist` messages to the `cmd_vel` topic can be used. The ROS package [`Nav2`](https://github.com/ros-navigation/navigation2) is an example that conforms to that.
 
-Commands must keep arriving: if no message is received for `cmd_vel_timeout` seconds (parameter, default 0.2, valid range (0, 2.0]; other values are rejected and the default is used), the target velocity is set to zero and the platform ramps down with its configured deceleration limits. Publish at a rate well above `1 / cmd_vel_timeout`.
+Commands must keep arriving: if no message is received for `cmd_vel_timeout` seconds (parameter, default 0.2, valid range (0, 2.0]; the driver refuses to start on any other value), the target velocity is set to zero and the platform ramps down with its configured deceleration limits. The timeout is checked in every EtherCAT cycle, so it holds even while the ROS loop is blocked; code driving `PlatformDriver::setTargetVelocity` directly gets the same 0.2 s default unless it calls `setCommandTimeout`. Publish at a rate well above `1 / cmd_vel_timeout`. A message with a NaN or Inf in any field is treated as a zero command.
 
 #### /joy
 
@@ -238,7 +282,7 @@ This function is called with a configuration setting for each wheel, in particul
 
 #### calculatePlatformRampedVelocities()
 
-This function ramps up or down the current velocity setpoints according to the acceleration limits and the platform's target velocities. Each dimension is considered separately from the others.
+This function ramps up or down the current velocity setpoints according to the acceleration limits and the platform's target velocities. Each dimension is considered separately from the others. Time comes from a monotonic clock; a negative or non-finite step ramps by nothing, and one step accelerates by at most 10 ms worth (`RampTiming.h`).
 
 
 #### calculateWheelTargetVelocity()
