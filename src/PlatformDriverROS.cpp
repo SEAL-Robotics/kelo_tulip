@@ -44,6 +44,8 @@
 
 #include "kelo_tulip/PlatformDriverROS.h"
 #include "kelo_tulip/OdometryFreshness.h"
+#include "kelo_tulip/ParameterValidation.h"
+#include "kelo_tulip/VelocityCommand.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -85,15 +87,20 @@ PlatformDriverROS::~PlatformDriverROS() {
 
 bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefix) {
 	this->nh = nh;
+	const DriverLimits defaults;
 	
 	nh->declare_parameter("num_wheels", 0);
-	nh->declare_parameter("vlin_max", 1.0);
-	nh->declare_parameter("va_max", 1.0);
-	nh->declare_parameter("vlin_acc_max", 0.5);
-	nh->declare_parameter("vlin_dec_max", 0.8); 
-	nh->declare_parameter("va_acc_max", 0.5); 
-	nh->declare_parameter("va_dec_max", 0.8);
-	nh->declare_parameter("angle_acc_max", 0.8);
+	nh->declare_parameter("vlin_max", defaults.vlinMax);
+	nh->declare_parameter("va_max", defaults.vaMax);
+	nh->declare_parameter("vlin_acc_max", defaults.vlinAccMax);
+	nh->declare_parameter("vlin_dec_max", defaults.vlinDecMax);
+	nh->declare_parameter("va_acc_max", defaults.vaAccMax);
+	nh->declare_parameter("va_dec_max", defaults.vaDecMax);
+	nh->declare_parameter("angle_acc_max", defaults.angleAccMax);
+	// The ramp the driver runs on its own when it is stopped while moving.
+	nh->declare_parameter("stop_vlin_dec", defaults.stopVlinDec);
+	nh->declare_parameter("stop_va_dec", defaults.stopVaDec);
+	nh->declare_parameter("stop_timeout", defaults.stopTimeoutSec);
 	nh->declare_parameter("active_by_joypad", false);
 	nh->declare_parameter("odom_frame", odomFrame);
 	nh->declare_parameter("base_frame", baseFrame);
@@ -120,14 +127,15 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 
 	rclcpp::Parameter num_wheels;
 	if (!nh->get_parameter("num_wheels", num_wheels)) {
-		RCLCPP_ERROR(nh->get_logger(), "Missing number of wheels in config file");
-		return -1;
+		RCLCPP_FATAL(nh->get_logger(), "Missing number of wheels in config file");
+		return false;
 	}
 	nWheels = num_wheels.as_int();
 
-	if (nWheels < 0) {
-		RCLCPP_ERROR(nh->get_logger(), "Invalid number of wheels in config file");
-		return -1;
+	if (nWheels < 1 || nWheels > bounds::MAX_WHEELS) {
+		RCLCPP_FATAL(nh->get_logger(), "num_wheels = %d is outside [1, %d]; refusing to start", nWheels,
+			bounds::MAX_WHEELS);
+		return false;
 	}
 
 	wheelConfigs.resize(nWheels);
@@ -138,10 +146,9 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	wheelData.resize(nWheels, data);
 
 	// read all wheel configs
+	configErrors.clear();
 	readWheelModels();
 	readWheelConfig();
-
-	driver = createDriver();
 
 	// Anything but an int or a double reads as NaN, which isValid rejects.
 	auto shapingNumber = [&nh](const char *name) {
@@ -160,29 +167,59 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	shaping.reorientStartError = shapingNumber("reorient_start_error");
 	shaping.reorientFullError = shapingNumber("reorient_full_error");
 	shaping.reorientMinScale = shapingNumber("reorient_min_scale");
-	std::string shapingProblem;
-	if (!isValid(shaping, &shapingProblem)) {
-		RCLCPP_ERROR(nh->get_logger(), "%s; current shaping is off", shapingProblem.c_str());
-		shaping = CurrentShapingConfig();
-	}
-	driver->setCurrentShaping(shaping);
 
-	// set driver control parameters
-	rclcpp::Parameter x;
-	if (nh->get_parameter("vlin_max", x))
-		driver->setMaxvlin(x.as_double());
-	if (nh->get_parameter("va_max", x))
-		driver->setMaxva(x.as_double());
-	if (nh->get_parameter("vlin_acc_max", x))
-		driver->setMaxvlinacc(x.as_double());
-	if (nh->get_parameter("vlin_dec_max", x))
-		driver->setMaxvlindec(x.as_double());
-	if (nh->get_parameter("angle_acc_max", x))
-		driver->setMaxangleacc(x.as_double());
-	if (nh->get_parameter("va_acc_max", x))
-		driver->setMaxvaacc(x.as_double());
-	if (nh->get_parameter("va_dec_max", x))
-		driver->setMaxvadec(x.as_double());
+	DriverLimits limits;
+	limits.vlinMax = nh->get_parameter("vlin_max").as_double();
+	limits.vaMax = nh->get_parameter("va_max").as_double();
+	limits.vlinAccMax = nh->get_parameter("vlin_acc_max").as_double();
+	limits.vlinDecMax = nh->get_parameter("vlin_dec_max").as_double();
+	limits.vaAccMax = nh->get_parameter("va_acc_max").as_double();
+	limits.vaDecMax = nh->get_parameter("va_dec_max").as_double();
+	limits.angleAccMax = nh->get_parameter("angle_acc_max").as_double();
+	limits.stopVlinDec = nh->get_parameter("stop_vlin_dec").as_double();
+	limits.stopVaDec = nh->get_parameter("stop_va_dec").as_double();
+	limits.stopTimeoutSec = nh->get_parameter("stop_timeout").as_double();
+	// If the /cmd_vel publisher dies or stalls, the last command would
+	// otherwise be held forever. There is deliberately no way to disable this.
+	limits.cmdVelTimeoutSec = nh->get_parameter("cmd_vel_timeout").as_double();
+
+	const int staleTicks = nh->get_parameter("odom_stale_ticks").as_int();
+	staleTwistCovariance = nh->get_parameter("stale_twist_covariance").as_double();
+
+	// A driver that moves a robot starts on a valid configuration or not at all.
+	std::vector<std::string> errors = configErrors;
+	for (const std::string &error : wheelConfigErrors(wheelConfigs))
+		errors.push_back(error);
+	for (const std::string &error : limitErrors(limits))
+		errors.push_back(error);
+	std::string shapingProblem;
+	if (!isValid(shaping, &shapingProblem))
+		errors.push_back("current shaping: " + shapingProblem);
+	if (staleTicks < 1)
+		errors.push_back("odom_stale_ticks = " + std::to_string(staleTicks) + " is below 1");
+	if (!isValidStaleTwistCovariance(staleTwistCovariance))
+		errors.push_back("stale_twist_covariance = " + std::to_string(staleTwistCovariance) +
+			" must be finite and > 0");
+	if (!errors.empty()) {
+		for (const std::string &error : errors)
+			RCLCPP_FATAL(nh->get_logger(), "Invalid parameter: %s", error.c_str());
+		RCLCPP_FATAL(nh->get_logger(), "Refusing to start with %zu invalid parameter(s)", errors.size());
+		return false;
+	}
+
+	driver = createDriver();
+	driver->setCurrentShaping(shaping);
+	driver->setMaxvlin(limits.vlinMax);
+	driver->setMaxva(limits.vaMax);
+	driver->setMaxvlinacc(limits.vlinAccMax);
+	driver->setMaxvlindec(limits.vlinDecMax);
+	driver->setMaxangleacc(limits.angleAccMax);
+	driver->setMaxvaacc(limits.vaAccMax);
+	driver->setMaxvadec(limits.vaDecMax);
+	driver->setStopParameters(limits.stopVlinDec, limits.stopVaDec, limits.stopTimeoutSec);
+	// The EtherCAT cycle enforces this; the ROS loop only reports it.
+	driver->setCommandTimeout(limits.cmdVelTimeoutSec);
+	cmdVelWatchdog.setTimeout(limits.cmdVelTimeoutSec);
 
 	rclcpp::Parameter b;
 	if (nh->get_parameter("active_by_joypad", b))
@@ -199,27 +236,9 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	if (nh->get_parameter("publish_tf", publishTfParam))
 		publishTf = publishTfParam.as_bool();
 
-	int staleTicks = nh->get_parameter("odom_stale_ticks").as_int();
-	if (staleTicks < 1) {
-		RCLCPP_ERROR(nh->get_logger(), "odom_stale_ticks %d is below 1, using %d",
-			staleTicks, OdometryFreshnessTracker::DEFAULT_STALE_TICKS);
-		staleTicks = OdometryFreshnessTracker::DEFAULT_STALE_TICKS;
-	}
 	encoderDeltaLimit = encoderDeltaLimitSec(staleTicks, LOOP_PERIOD_SEC, wheelAliasingLimitSec());
 	maxHeldGap = staleTicks * LOOP_PERIOD_SEC + 0.5 * LOOP_PERIOD_SEC;
 	freshnessTracker = std::make_unique<OdometryFreshnessTracker>(nWheels, staleTicks);
-	staleTwistCovariance = nh->get_parameter("stale_twist_covariance").as_double();
-	if (!isValidStaleTwistCovariance(staleTwistCovariance)) {
-		RCLCPP_ERROR(nh->get_logger(), "stale_twist_covariance %f must be finite and > 0, using 1e6", staleTwistCovariance);
-		staleTwistCovariance = 1e6;
-	}
-
-	// If the /cmd_vel publisher dies or stalls, the last command would
-	// otherwise be held forever. There is deliberately no way to disable this.
-	double cmdVelTimeout = nh->get_parameter("cmd_vel_timeout").as_double();
-	if (!cmdVelWatchdog.setTimeout(cmdVelTimeout))
-		RCLCPP_ERROR(nh->get_logger(), "cmd_vel_timeout %f s is outside (0, %.1f], using %.3f s",
-			cmdVelTimeout, CommandWatchdog::MAX_TIMEOUT_SEC, cmdVelWatchdog.getTimeout());
 
 	odomPublisher = nh->create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
 	odomInitializedPublisher = nh->create_publisher<std_msgs::msg::Empty>("/odom_initialized", 10);
@@ -242,9 +261,8 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 }
 
 bool PlatformDriverROS::step() {
-	// Stop when /cmd_vel goes silent; the controller then ramps down with
-	// vlin_dec_max/va_dec_max. Checked at the ROS loop rate, so the reaction
-	// time is cmd_vel_timeout plus up to one loop period.
+	// The EtherCAT cycle already ramps a silent /cmd_vel to zero on its own;
+	// this is the second line and the log.
 	if (cmdVelWatchdog.checkExpired(CommandWatchdog::Clock::now())) {
 		driver->setTargetVelocity(0, 0, 0);
 		RCLCPP_WARN(nh->get_logger(), "No /cmd_vel for %.3f s, commanding zero velocity", cmdVelWatchdog.getTimeout());
@@ -344,6 +362,8 @@ void PlatformDriverROS::readWheelModels() {
 		wm.velocitylimit = nh->get_parameter(prefix + "velocitylimit").as_double();
 		wm.currentlimit = nh->get_parameter(prefix + "currentlimit").as_double();
 		wm.standbycurrent = nh->get_parameter(prefix + "standbycurrent").as_double();
+		for (const std::string &error : wheelModelErrors(wm))
+			configErrors.push_back(error);
 		wheelModels[name] = wm;
 	}
 	
@@ -404,7 +424,8 @@ void PlatformDriverROS::readWheelConfig() {
 			if (wheelModels.count(model.as_string()) > 0) {
 				config.model = wheelModels[model.as_string()];
 			} else {
-				RCLCPP_WARN(nh->get_logger(), "Unknown wheel model: %s", model.value_to_string().c_str());
+				configErrors.push_back(groupName + ".model = " + model.value_to_string() +
+				" is not in wheel_models.list");
 			}
 		}
 
@@ -870,7 +891,12 @@ void PlatformDriverROS::joyCallbackImpl(const sensor_msgs::msg::Joy::SharedPtr j
 
 void PlatformDriverROS::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg) {
 	cmdVelWatchdog.kick(CommandWatchdog::Clock::now());
-	driver->setTargetVelocity(msg->linear.x, msg->linear.y, msg->angular.z);
+	VelocityCommand command{msg->linear.x, msg->linear.y, msg->angular.z};
+	if (!sanitizeCommand(command))
+		RCLCPP_WARN_THROTTLE(nh->get_logger(), *nh->get_clock(), 1000,
+			"Non-finite /cmd_vel (%f, %f, %f), commanding zero velocity", msg->linear.x, msg->linear.y,
+			msg->angular.z);
+	driver->setTargetVelocity(command.vx, command.vy, command.va);
 }
 
 void PlatformDriverROS::resetCallback(const std_msgs::msg::Empty::SharedPtr msg) const {

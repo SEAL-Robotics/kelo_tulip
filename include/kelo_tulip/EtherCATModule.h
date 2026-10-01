@@ -67,6 +67,11 @@ public:
 	// Called by the master before the loop starts; the module then records
 	// into the box from the EtherCAT thread. Modules that record nothing ignore it.
 	virtual void setBlackBox(EthercatBlackBox*) {}
+
+	// Called from another thread when the process is about to exit. A module
+	// that moves hardware brings it to a safe state from step() and returns
+	// false from step() once it has; the others ignore it.
+	virtual void requestStop() {}
 };
 
 } // namespace kelp

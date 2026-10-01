@@ -92,6 +92,7 @@ add_library(tulip_library
 	src/EtherCATModuleROS.cpp
 	src/PlatformDriver.cpp
 	src/PlatformDriverROS.cpp
+	src/ParameterValidation.cpp
 	src/EscCounters.cpp
 	src/DumpPolicy.cpp
 	src/EthercatBlackBox.cpp
@@ -248,6 +249,31 @@ if(BUILD_TESTING)
 	ament_add_gtest(test_velocity_platform_controller test/test_velocity_platform_controller.cpp)
 	target_link_libraries(test_velocity_platform_controller tulip_velocity_controller)
 	target_link_libraries(test_platform_driver_ros_watchdog tulip_library)
+	ament_add_gtest(test_ramp_timing test/test_ramp_timing.cpp)
+	ament_add_gtest(test_stop_sequence test/test_stop_sequence.cpp)
+	ament_add_gtest(test_velocity_command test/test_velocity_command.cpp)
+	target_link_libraries(test_velocity_command pthread)
+	ament_add_gtest(test_parameter_validation test/test_parameter_validation.cpp)
+	target_link_libraries(test_parameter_validation tulip_library)
+	ament_add_gtest(test_platform_driver_stop test/test_platform_driver_stop.cpp)
+	target_link_libraries(test_platform_driver_stop tulip_library)
+
+	# Tests never join a live robot's DDS network: a shell on a robot, or a
+	# laptop on its LAN, may carry that robot's domain and peer list. Every
+	# test registered in this directory tree gets its own domain and
+	# localhost-only discovery, whatever the caller's environment says.
+	function(kelo_tulip_isolate_ros_tests dir)
+		get_property(_tests DIRECTORY "${dir}" PROPERTY TESTS)
+		if(_tests)
+			set_tests_properties(${_tests} DIRECTORY "${dir}" PROPERTIES ENVIRONMENT_MODIFICATION
+				"ROS_DOMAIN_ID=set:98;ROS_AUTOMATIC_DISCOVERY_RANGE=set:LOCALHOST;CYCLONEDDS_URI=unset:;DDS_LOCAL_IP=unset:;ROS_STATIC_PEERS=unset:;ROS_LOCALHOST_ONLY=unset:")
+		endif()
+		get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+		foreach(_sub IN LISTS _subdirs)
+			kelo_tulip_isolate_ros_tests("${_sub}")
+		endforeach()
+	endfunction()
+	kelo_tulip_isolate_ros_tests("${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 ament_package()

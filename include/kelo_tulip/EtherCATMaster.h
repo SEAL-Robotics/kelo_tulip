@@ -59,6 +59,7 @@ extern "C" {
 }
 #include <boost/thread.hpp>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <fstream>
@@ -88,6 +89,10 @@ public:
 	bool reinitializeEthercat();
 	bool needsReinit();
 	bool hasStopped() const;
+	//! Thread-safe: asks every module to bring its hardware to a safe state
+	//! and end the loop (EtherCATModule::requestStop). hasStopped() turns true
+	//! once one has.
+	void requestStop();
 	
 	bool hasWkcError();
 	void resetErrorFlags();

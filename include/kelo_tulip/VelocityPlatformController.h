@@ -51,6 +51,7 @@
 #include <kelo_tulip/WheelConfig.h>
 #include <kelo_tulip/CurrentShaping.h>
 #include <boost/thread.hpp>
+#include <chrono>
 #include <iostream>
 
 namespace kelo
@@ -74,8 +75,11 @@ namespace kelo
             void setPlatformMaxAngDeceleration(float max_dec_angular);
             
             void calculatePlatformRampedVelocities();
-            //! Same, for a caller-supplied time step (s).
+            //! Same, for a caller-supplied time step (s). A negative or
+            //! non-finite step ramps by nothing (RampTiming.h).
             void calculatePlatformRampedVelocities(float time_delta);
+            //! The ramped platform velocity has reached zero on every axis.
+            bool isRampedVelocityZero() const;
 
             void setCurrentShaping(const CurrentShapingConfig& config);
             //! A disabled or recovering wheel is commanded 0, keeps no slew
@@ -117,7 +121,7 @@ namespace kelo
             float reorient_scale_ = 1.0f;
             float ramp_dt_ = 0.0f;  // s, last ramping step
 
-        	  boost::posix_time::ptime time_last_ramping;
+        	  std::chrono::steady_clock::time_point time_last_ramping;
         	  bool first_ramping_call;
     };
 

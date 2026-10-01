@@ -153,6 +153,8 @@ protected:
 	rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr enableSubscriber;
 
 	int nWheels;
+	// Wheel-model problems found while reading; init refuses to start on any.
+	std::vector<std::string> configErrors;
 
 	bool debugMode;
 	bool activeByJoypad;

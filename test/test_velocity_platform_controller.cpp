@@ -1,8 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <chrono>
+#include <limits>
 #include <random>
+#include <thread>
 
+#include "kelo_tulip/RampTiming.h"
 #include "kelo_tulip/VelocityPlatformController.h"
 
 using namespace kelo;
@@ -355,5 +359,119 @@ TEST(VelocityPlatformControllerShaping, ShapedHubSetpointNeverExceedsLegacyPrope
 				ASSERT_LE(std::fabs(r), std::fabs(lr) + 1e-4f) << "trial " << trial;
 			}
 		}
+	}
+}
+
+namespace {
+
+constexpr float HUB_RADIUS = 0.0825f;
+
+VelocityPlatformController limitedController(float acc, float dec) {
+	VelocityPlatformController c;
+	c.initialise(fourWheels());
+	c.setPlatformMaxLinVelocity(2.0f);
+	c.setPlatformMaxAngVelocity(1.0f);
+	c.setPlatformMaxLinAcceleration(acc);
+	c.setPlatformMaxAngAcceleration(acc);
+	c.setPlatformMaxLinDeceleration(dec);
+	c.setPlatformMaxAngDeceleration(dec);
+	return c;
+}
+
+// Platform speed implied by the hub setpoints with the casters aligned.
+float hubSpeed(VelocityPlatformController &c) {
+	float out[4][2];
+	wheelSetpoints(c, 0.0f, out);
+	return std::fabs(out[0][0]) * HUB_RADIUS;
+}
+
+}  // namespace
+
+TEST(VelocityPlatformControllerClock, aBackwardsTimeStepLeavesAnIdleBaseIdle) {
+	VelocityPlatformController c = limitedController(1.0f, 1.0f);
+	c.setPlatformTargetVelocity(0.0f, 0.0f, 0.0f);
+
+	c.calculatePlatformRampedVelocities(-3600.0f);
+
+	EXPECT_TRUE(c.isRampedVelocityZero());
+}
+
+TEST(VelocityPlatformControllerClock, aBackwardsTimeStepNeverMovesTheRampedVelocity) {
+	VelocityPlatformController c = limitedController(1.0f, 1.0f);
+	c.setPlatformTargetVelocity(1.0f, 0.0f, 0.0f);
+	for (int i = 0; i < 300; i++)
+		c.calculatePlatformRampedVelocities(DT);
+	const float before = hubSpeed(c);
+
+	c.setPlatformTargetVelocity(0.0f, 0.0f, 0.0f);
+	c.calculatePlatformRampedVelocities(-0.5f);
+
+	EXPECT_NEAR(hubSpeed(c), before, 1e-4f);
+}
+
+TEST(VelocityPlatformControllerClock, aNonFiniteTimeStepRampsByNothing) {
+	VelocityPlatformController c = limitedController(1.0f, 1.0f);
+	c.setPlatformTargetVelocity(1.0f, 0.0f, 0.0f);
+
+	c.calculatePlatformRampedVelocities(std::numeric_limits<float>::quiet_NaN());
+	c.calculatePlatformRampedVelocities(std::numeric_limits<float>::infinity());
+
+	EXPECT_TRUE(c.isRampedVelocityZero());
+}
+
+TEST(VelocityPlatformControllerClock, aHugeTimeStepAcceleratesByAtMostTheClampedStep) {
+	VelocityPlatformController c = limitedController(1.0f, 1.0f);
+	c.setPlatformTargetVelocity(2.0f, 0.0f, 0.0f);
+
+	c.calculatePlatformRampedVelocities(3600.0f);
+
+	EXPECT_LE(hubSpeed(c), 1.0f * MAX_ACCEL_DT_SEC + 1e-4f);
+	EXPECT_GT(hubSpeed(c), 0.0f);
+}
+
+TEST(VelocityPlatformControllerClock, aSlowLoopStillBrakesAtTheConfiguredRate) {
+	VelocityPlatformController c = limitedController(1.0e6f, 1.0f);
+	c.setPlatformTargetVelocity(1.0f, 0.0f, 0.0f);
+	c.calculatePlatformRampedVelocities(DT);
+	ASSERT_NEAR(hubSpeed(c), 1.0f, 1e-3f);
+
+	c.setPlatformTargetVelocity(0.0f, 0.0f, 0.0f);
+	c.calculatePlatformRampedVelocities(0.05f);  // a 20 Hz loop
+
+	EXPECT_NEAR(hubSpeed(c), 0.95f, 1e-3f);
+}
+
+TEST(VelocityPlatformControllerClock, theWallClockOverloadRampsOnElapsedMonotonicTime) {
+	VelocityPlatformController c = limitedController(1.0f, 1.0f);
+	c.setPlatformTargetVelocity(1.0f, 0.0f, 0.0f);
+
+	c.calculatePlatformRampedVelocities();  // first call only starts the clock
+	EXPECT_TRUE(c.isRampedVelocityZero());
+	std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	c.calculatePlatformRampedVelocities();
+
+	EXPECT_GT(hubSpeed(c), 0.0f);
+	EXPECT_LE(hubSpeed(c), 1.0f * MAX_ACCEL_DT_SEC + 1e-4f);
+}
+
+TEST(VelocityPlatformControllerTarget, aNonFiniteTargetIsAStop) {
+	VelocityPlatformController c = limitedController(1.0e6f, 1.0e6f);
+	c.setPlatformTargetVelocity(0.5f, 0.0f, 0.0f);
+	c.calculatePlatformRampedVelocities(DT);
+	ASSERT_FALSE(c.isRampedVelocityZero());
+
+	for (const float bad : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+			-std::numeric_limits<float>::infinity()}) {
+		c.setPlatformTargetVelocity(0.5f, bad, 0.0f);
+		c.calculatePlatformRampedVelocities(DT);
+		EXPECT_TRUE(c.isRampedVelocityZero());
+		float out[4][2];
+		wheelSetpoints(c, 0.0f, out);
+		for (int i = 0; i < 4; i++) {
+			EXPECT_EQ(out[i][0], 0.0f);
+			EXPECT_EQ(out[i][1], 0.0f);
+		}
+		c.setPlatformTargetVelocity(0.5f, 0.0f, 0.0f);
+		c.calculatePlatformRampedVelocities(DT);
 	}
 }

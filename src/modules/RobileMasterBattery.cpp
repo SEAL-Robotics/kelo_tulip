@@ -115,7 +115,6 @@ bool RobileMasterBattery::step() {
 	if (flagShutdown)
 		data.Shutdown = 0x80;
 
-	boost::posix_time::ptime now = boost::posix_time::microsec_clock::local_time();
 	if (flagResetError || (autoResetError && input->Error != 0)) {
 		data.Command1 = 0x10;
 		flagResetError = false;
@@ -174,7 +173,7 @@ void RobileMasterBattery::pump(bool enablePump) {
 	std::cout << "inside SmartWheelDriver::robileMasterBatteryPump " << enablePump << std::endl;
 	robileEnablePump = enablePump;
 	if (enablePump) {
-		pumpStartTime = boost::posix_time::microsec_clock::local_time();
+		pumpStartTime = std::chrono::steady_clock::now();
 		std::cout << std::endl << "Enabling pump" << std::endl << std::endl;
 	}
 }
@@ -183,7 +182,7 @@ void RobileMasterBattery::dock(bool dock) {
 	std::cout << "inside SmartWheelDriver::robileMasterBatteryDock " << dock << std::endl;
 	robileEnableDock = dock;
 	if ( dock ) {
-		dockStartTime = boost::posix_time::microsec_clock::local_time();
+		dockStartTime = std::chrono::steady_clock::now();
 		std::cout << std::endl << "Enabling dock" << std::endl << std::endl;
 	}
 }
@@ -192,7 +191,7 @@ void RobileMasterBattery::undock(bool undock) {
 	std::cout << "inside SmartWheelDriver::robileMasterBatteryUndock " << undock << std::endl;
 	robileEnableUndock = undock;
 	if ( undock ) {
-		undockStartTime = boost::posix_time::microsec_clock::local_time();
+		undockStartTime = std::chrono::steady_clock::now();
 		std::cout << std::endl << "Enabling undock" << std::endl << std::endl;
 	}
 }

@@ -47,6 +47,7 @@
 
 #include "kelo_tulip/EtherCATModule.h"
 #include <boost/thread.hpp>
+#include <chrono>
 
 namespace kelo {
 
@@ -85,9 +86,9 @@ private:
 
 	bool autoResetError;
 
-	boost::posix_time::ptime pumpStartTime;
-	boost::posix_time::ptime dockStartTime;
-	boost::posix_time::ptime undockStartTime;
+	std::chrono::steady_clock::time_point pumpStartTime;
+	std::chrono::steady_clock::time_point dockStartTime;
+	std::chrono::steady_clock::time_point undockStartTime;
 		
 	float voltage;
 };

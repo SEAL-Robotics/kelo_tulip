@@ -44,6 +44,8 @@
 #include "kelo_tulip/PlatformDriver.h"
 #include <algorithm>
 #include <iostream>
+#include <limits>
+#include "kelo_tulip/CommandWatchdog.h"
 #include "kelo_tulip/RtLog.h"
 
 extern "C" {
@@ -193,6 +195,11 @@ bool PlatformDriver::stepStateMachine() {
 	for (int i = 0; i < nWheels; i++)
 		applyWheelEnable(i);
 
+	if (stopRequestedFlag.load() && !stopSequence.requested())
+		beginStop("Stop requested");
+	if (stopSequence.requested())
+		return stepStopping();
+
 	switch (state) {
 		case DRIVER_STATE_INIT:   return stepInit();
 		case DRIVER_STATE_READY:  return stepReady();
@@ -266,11 +273,93 @@ bool PlatformDriver::stepReady() {
 bool PlatformDriver::stepActive() {
 	doControl();
 	// A wheel recovery gave up on is disabled; driving on the others is not
-	// safe, so stop EtherCAT and let the stack restart.
-	if (anyWheelFailed()) {
-		RtLog::instance().push("Stopping platform driver, because a wheel could not be recovered.");
-		return false;
+	// safe. The failed wheel keeps every wheel holding, so the rest ramp to
+	// zero at the hold rate and are braked to rest before EtherCAT stops and
+	// the stack restarts; ending the loop at once left them coasting.
+	if (anyWheelFailed())
+		beginStop("Stopping platform driver, because a wheel could not be recovered");
+	return true;
+}
+
+void PlatformDriver::beginStop(const char* reason) {
+	if (stopSequence.requested())
+		return;
+	stopRequestedFlag.store(true);
+	const bool moving = state == DRIVER_STATE_ACTIVE;
+	// Never brake harder than the configured deceleration.
+	velocityPlatformController.setPlatformMaxLinDeceleration(std::min(maxvlindec, stopVlinDec));
+	velocityPlatformController.setPlatformMaxAngDeceleration(std::min(maxvadec, stopVaDec));
+	stopSequence.request(nowMs(), moving);
+	if (moving)
+		RtLog::instance().pushf("%s: ramping the wheels to zero, then disabling the drives (at most %.1f s).",
+			reason, stopSequence.config().timeoutMs / 1000.0);
+	else
+		RtLog::instance().pushf("%s: the base was not driving, disabling the drives.", reason);
+}
+
+bool PlatformDriver::stepStopping() {
+	const StopPhase before = stopSequence.phase();
+	bool commandedAtRest = true;
+	if (stopSequence.drivesEnabled()) {
+		doControl();
+		commandedAtRest = velocityPlatformController.isRampedVelocityZero() && wheelSetpointsZero();
+	} else {
+		doDisable();
 	}
+
+	const StopPhase after = stopSequence.step(nowMs(), commandedAtRest, maxHubSpeed());
+	if (after != before) {
+		RtLog& log = RtLog::instance();
+		if (after == StopPhase::Settling)
+			log.push("Stop: setpoints at zero, holding until the wheels are still.");
+		else if (after == StopPhase::Disabling && stopSequence.timedOut())
+			log.pushf("Stop: not at rest after %.1f s, disabling the drives anyway (max hub speed %.2f rad/s).",
+				stopSequence.config().timeoutMs / 1000.0, maxHubSpeed());
+		else if (after == StopPhase::Disabling && before != StopPhase::Running)
+			log.push("Stop: wheels still, disabling the drives.");
+		else if (after == StopPhase::Done)
+			log.push("Stop: drives disabled, ending the EtherCAT loop.");
+	}
+	return after != StopPhase::Done;
+}
+
+void PlatformDriver::requestStop() {
+	stopRequestedFlag.store(true);
+}
+
+void PlatformDriver::setCommandTimeout(double sec) {
+	if (CommandWatchdog::isValidTimeout(sec))
+		commandTimeoutMs.store(sec * 1000.0);
+}
+
+void PlatformDriver::setStopParameters(double vlinDec, double vaDec, double timeoutSec) {
+	if (std::isfinite(vlinDec) && vlinDec > 0)
+		stopVlinDec = vlinDec;
+	if (std::isfinite(vaDec) && vaDec > 0)
+		stopVaDec = vaDec;
+	if (std::isfinite(timeoutSec) && timeoutSec > 0) {
+		StopConfig config = stopSequence.config();
+		config.timeoutMs = timeoutSec * 1000.0;
+		stopSequence.setConfig(config);
+	}
+}
+
+double PlatformDriver::maxHubSpeed() const {
+	double fastest = 0.0;
+	for (int i = 0; i < nWheels; i++) {
+		for (const float v : {processData[i].velocity_1, processData[i].velocity_2}) {
+			if (!std::isfinite(v))
+				return std::numeric_limits<double>::infinity();
+			fastest = std::max(fastest, static_cast<double>(std::fabs(v)));
+		}
+	}
+	return fastest;
+}
+
+bool PlatformDriver::wheelSetpointsZero() const {
+	for (const float setpoint : wheelSetpoints)
+		if (setpoint != 0.0f)
+			return false;
 	return true;
 }
 
@@ -293,7 +382,27 @@ bool PlatformDriver::stepError() {
 }
 
 void PlatformDriver::setTargetVelocity(double vx, double vy, double va) {
-	velocityPlatformController.setPlatformTargetVelocity(vx, vy, va);
+	if (stopRequestedFlag.load())
+		return;
+	VelocityCommand command{vx, vy, va};
+	sanitizeCommand(command);
+	commandMailbox.post(command, nowMs());
+}
+
+void PlatformDriver::updateCycleTarget(double now) {
+	commandMailbox.tryFetch(cycleCommand);
+	const bool stale = commandExpired(cycleCommand, now, commandTimeoutMs.load());
+	if (stale && !commandStale)
+		RtLog::instance().pushf("No velocity command for %.0f ms, ramping to zero.", commandTimeoutMs.load());
+	else if (!stale && commandStale)
+		RtLog::instance().push("Velocity commands are back.");
+	commandStale = stale;
+
+	if (stale || stopSequence.requested())
+		velocityPlatformController.setPlatformTargetVelocity(0.0f, 0.0f, 0.0f);
+	else
+		velocityPlatformController.setPlatformTargetVelocity(cycleCommand.command.vx, cycleCommand.command.vy,
+			cycleCommand.command.va);
 }
 
 void PlatformDriver::setCanChangeActive() {
@@ -333,10 +442,12 @@ void PlatformDriver::setMaxvaacc(double x) {
 }
 
 void PlatformDriver::setMaxvlindec(double x) {
+	maxvlindec = x;
 	velocityPlatformController.setPlatformMaxLinDeceleration(x);
 }
 
 void PlatformDriver::setMaxvadec(double x) {
+	maxvadec = x;
 	velocityPlatformController.setPlatformMaxAngDeceleration(x);
 }
 
@@ -587,8 +698,14 @@ void PlatformDriver::doControl() {
 	rxdata.setpoint1 = 0;
 	rxdata.setpoint2 = 0;
 
+	// Checked every cycle, so a stalled ROS executor still stops the base.
+	const double now = nowMs();
+	updateCycleTarget(now);
+
 	// update desired velocity of platform, based on target velocity and velocity ramps
-	velocityPlatformController.calculatePlatformRampedVelocities();
+	const double rampDtSec = std::isfinite(lastControlMs) ? (now - lastControlMs) / 1000.0 : 0.0;
+	lastControlMs = now;
+	velocityPlatformController.calculatePlatformRampedVelocities(static_cast<float>(rampDtSec));
 
 	advanceRecoveryClock();
 	for (int i = 0; i < nWheels; i++)
@@ -639,12 +756,31 @@ void PlatformDriver::doControl() {
 		rxdata.limit2_p = wheelConfigs[i].model.currentlimit;
 		rxdata.limit2_n = -wheelConfigs[i].model.currentlimit;
 
-		/* send calculated target velocity values to EtherCAT */
-		rxdata.setpoint1 = wheelSetpoints[2 * i];
-		rxdata.setpoint2 = wheelSetpoints[2 * i + 1];
+		/* send calculated target velocity values to EtherCAT; clip passes NaN
+		 * through, and a NaN setpoint must never reach a drive */
+		rxdata.setpoint1 = std::isfinite(wheelSetpoints[2 * i]) ? wheelSetpoints[2 * i] : 0.0f;
+		rxdata.setpoint2 = std::isfinite(wheelSetpoints[2 * i + 1]) ? wheelSetpoints[2 * i + 1] : 0.0f;
 
 		setWheelProcessData(i, &rxdata);
 	}
+}
+
+void PlatformDriver::doDisable() {
+	rxpdo1_t rxdata;
+	rxdata.timestamp = current_ts + 100 * 1000;
+	rxdata.setpoint1 = 0;
+	rxdata.setpoint2 = 0;
+	rxdata.command1 = COM1_MODE_VELOCITY;
+	rxdata.command2 = COM2_MODE_VELOCITY;
+	for (int i = 0; i < nWheels; i++) {
+		rxdata.limit1_p = wheelConfigs[i].model.standbycurrent;
+		rxdata.limit1_n = -wheelConfigs[i].model.standbycurrent;
+		rxdata.limit2_p = wheelConfigs[i].model.standbycurrent;
+		rxdata.limit2_n = -wheelConfigs[i].model.standbycurrent;
+		setWheelProcessData(i, &rxdata);
+	}
+	std::fill(wheelSetpoints.begin(), wheelSetpoints.end(), 0.0f);
+	setpointSlew.reset();
 }
 
 void PlatformDriver::advanceRecoveryClock() {

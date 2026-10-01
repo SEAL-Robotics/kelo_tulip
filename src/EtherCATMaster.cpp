@@ -100,6 +100,13 @@ EtherCATMaster::~EtherCATMaster() {
 	}
 	for (EtherCATModule* module : modules)
 		module->setBlackBox(nullptr);
+	// Slaves left in OP keep their last outputs until their own timeout.
+	closeEthercat();
+}
+
+void EtherCATMaster::requestStop() {
+	for (EtherCATModule* module : modules)
+		module->requestStop();
 }
 
 void EtherCATMaster::enableBlackBox(const BlackBoxConfig& config) {
@@ -300,8 +307,9 @@ void EtherCATMaster::ethercatHandler() {
 	int step = 0;
 	int wkc2 = 0;
 	long timeToWait = 0;
-	boost::posix_time::ptime startTime = boost::posix_time::microsec_clock::local_time();
-	boost::posix_time::time_duration pastTime;
+	// Monotonic: a wall-clock step must not skip or stretch a cycle.
+	using CycleClock = std::chrono::steady_clock;
+	CycleClock::time_point startTime = CycleClock::now();
 
 	unsigned int ethercatTimeout = 1000;
 	long int communicationErrors = 0;
@@ -310,8 +318,8 @@ void EtherCATMaster::ethercatHandler() {
 	ecx_send_processdata(&ecx_context);
 	
 	while (!stopThread) {
-		pastTime = boost::posix_time::microsec_clock::local_time() - startTime;
-		timeToWait = timeTillNextEthercatUpdate - pastTime.total_microseconds();
+		timeToWait = timeTillNextEthercatUpdate
+			- std::chrono::duration_cast<std::chrono::microseconds>(CycleClock::now() - startTime).count();
 
 		if (timeToWait < 0 || timeToWait > (int) timeTillNextEthercatUpdate) {
 			//printf("Missed communication period of %d  microseconds it have been %d microseconds \n",timeTillNextEthercatUpdate, (int)pastTime.total_microseconds()+ 100);
@@ -324,7 +332,7 @@ void EtherCATMaster::ethercatHandler() {
 			pauseThreadMs = 0;
 		}
 
-		startTime = boost::posix_time::microsec_clock::local_time();
+		startTime = CycleClock::now();
 
 		wkc = ecx_receive_processdata(&ecx_context, ethercatTimeout);
 		if (blackBox)
@@ -367,7 +375,7 @@ void EtherCATMaster::ethercatHandler() {
 			modulesOK = modules[i]->step();
 
 		if (!modulesOK) {
-			RtLog::instance().push("EtherCAT module failed, stopping EtherCAT communication.");
+			RtLog::instance().push("EtherCAT module failed or finished its stop, stopping EtherCAT communication.");
 			// The poller reads through the port that is about to close.
 			if (escDiagnostics)
 				escDiagnostics->stop();

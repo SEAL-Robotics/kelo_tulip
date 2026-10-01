@@ -43,6 +43,7 @@
 
 
 #include <kelo_tulip/VelocityPlatformController.h>
+#include <kelo_tulip/RampTiming.h>
 #include <math.h>
 #include <algorithm>
 
@@ -101,6 +102,14 @@ namespace kelo
             const float &vel_y,
             const float &vel_a)
     {
+        /* a non-finite axis would poison the ramp state for good: stop instead */
+        if ( !std::isfinite(vel_x) || !std::isfinite(vel_y) || !std::isfinite(vel_a) )
+        {
+            platform_target_vel_.x = 0.0f;
+            platform_target_vel_.y = 0.0f;
+            platform_target_vel_.a = 0.0f;
+            return;
+        }
         platform_target_vel_.x = ( fabs(vel_x) < 0.0000001 ) ? 0.0 : vel_x;
         platform_target_vel_.y = ( fabs(vel_y) < 0.0000001 ) ? 0.0 : vel_y;
         platform_target_vel_.a = ( fabs(vel_a) < 0.0000001 ) ? 0.0 : vel_a;
@@ -180,24 +189,27 @@ namespace kelo
             
     void VelocityPlatformController::calculatePlatformRampedVelocities()
     {
-        boost::posix_time::ptime now = boost::posix_time::microsec_clock::local_time();
-        	
+        // Monotonic: a wall-clock step (NTP, a manual date change) must never
+        // read as elapsed time.
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
         // if this is called the first time, calculating time delta that way makes no sense
         if (first_ramping_call) {
             first_ramping_call = false;
             time_last_ramping = now;
             return;
         }
-        	
-        float time_delta = (now - time_last_ramping).total_microseconds() / 1000000.0f;
+
+        const float time_delta = std::chrono::duration<float>(now - time_last_ramping).count();
         time_last_ramping = now;
         calculatePlatformRampedVelocities(time_delta);
     }
 
     void VelocityPlatformController::calculatePlatformRampedVelocities(float time_delta)
     {
-        ramp_dt_ = time_delta;
-        if (time_delta > PAUSE_GAP_SEC)
+        const RampStep step = rampStep(time_delta);
+        ramp_dt_ = step.accelDt;
+        if (step.paused)
         {
             /* the driver was paused: hubs are at rest, not where the last
              * setpoint left them */
@@ -206,40 +218,45 @@ namespace kelo
             std::fill(last_pivot_error_.begin(), last_pivot_error_.end(), 0.0f);
         }
 
+        const float acc_lin = step.accelDt * platform_limits_.max_acc_linear;
+        const float dec_lin = step.decelDt * platform_limits_.max_dec_linear;
+        const float acc_ang = step.accelDt * platform_limits_.max_acc_angular;
+        const float dec_ang = step.decelDt * platform_limits_.max_dec_angular;
+
         // velocity ramps
         if (platform_ramped_vel_.x >= 0) {
             platform_ramped_vel_.x = Utils::clip(platform_target_vel_.x,
-                platform_ramped_vel_.x + time_delta * platform_limits_.max_acc_linear,
-                platform_ramped_vel_.x - time_delta * platform_limits_.max_dec_linear
+                platform_ramped_vel_.x + acc_lin,
+                platform_ramped_vel_.x - dec_lin
             );
         } else {
             platform_ramped_vel_.x = Utils::clip(platform_target_vel_.x,
-                platform_ramped_vel_.x + time_delta * platform_limits_.max_dec_linear,
-                platform_ramped_vel_.x - time_delta * platform_limits_.max_acc_linear
+                platform_ramped_vel_.x + dec_lin,
+                platform_ramped_vel_.x - acc_lin
             );
         }
 
         if (platform_ramped_vel_.y >= 0) {
             platform_ramped_vel_.y = Utils::clip(platform_target_vel_.y,
-                platform_ramped_vel_.y + time_delta * platform_limits_.max_acc_linear,
-                platform_ramped_vel_.y - time_delta * platform_limits_.max_dec_linear
+                platform_ramped_vel_.y + acc_lin,
+                platform_ramped_vel_.y - dec_lin
             );
         } else {
             platform_ramped_vel_.y = Utils::clip(platform_target_vel_.y,
-                platform_ramped_vel_.y + time_delta * platform_limits_.max_dec_linear,
-                platform_ramped_vel_.y - time_delta * platform_limits_.max_acc_linear
+                platform_ramped_vel_.y + dec_lin,
+                platform_ramped_vel_.y - acc_lin
             );
         }
 
         if (platform_ramped_vel_.a >= 0) {
             platform_ramped_vel_.a = Utils::clip(platform_target_vel_.a,
-                platform_ramped_vel_.a + time_delta * platform_limits_.max_acc_angular,
-                platform_ramped_vel_.a - time_delta * platform_limits_.max_dec_angular
+                platform_ramped_vel_.a + acc_ang,
+                platform_ramped_vel_.a - dec_ang
             );
         } else {
             platform_ramped_vel_.a = Utils::clip(platform_target_vel_.a,
-                platform_ramped_vel_.a + time_delta * platform_limits_.max_dec_angular,
-                platform_ramped_vel_.a - time_delta * platform_limits_.max_acc_angular
+                platform_ramped_vel_.a + dec_ang,
+                platform_ramped_vel_.a - acc_ang
             );
         }
         
@@ -247,6 +264,11 @@ namespace kelo
         platform_ramped_vel_.x = Utils::clip(platform_ramped_vel_.x, platform_limits_.max_vel_linear, -platform_limits_.max_vel_linear);
         platform_ramped_vel_.y = Utils::clip(platform_ramped_vel_.y, platform_limits_.max_vel_linear, -platform_limits_.max_vel_linear);
         platform_ramped_vel_.a = Utils::clip(platform_ramped_vel_.a, platform_limits_.max_vel_angular, -platform_limits_.max_vel_angular);
+    }
+
+    bool VelocityPlatformController::isRampedVelocityZero() const
+    {
+        return platform_ramped_vel_.x == 0 && platform_ramped_vel_.y == 0 && platform_ramped_vel_.a == 0;
     }
 
     void VelocityPlatformController::calculateWheelTargetVelocity(

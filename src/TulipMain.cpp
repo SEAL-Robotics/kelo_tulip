@@ -44,12 +44,73 @@
 #include "kelo_tulip/DriverLiveness.h"
 #include "kelo_tulip/EscDiagnosticsRos.h"
 #include "kelo_tulip/EtherCATMaster.h"
+#include "kelo_tulip/ParameterValidation.h"
 #include "kelo_tulip/PlatformDriverROS.h"
 #include "kelo_tulip/modules/RobileMasterBatteryROS.h"
 #include "rclcpp/rclcpp.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
+#include <thread>
+
+namespace {
+
+// Set from the signal handler. rclcpp's own handler is not installed: it
+// would shut the context down at once, and the exit must instead keep the
+// EtherCAT loop alive until the wheels have been ramped to zero.
+std::atomic<bool> exitRequested{false};
+static_assert(std::atomic<bool>::is_always_lock_free, "signal handler needs a lock-free flag");
+
+extern "C" void onExitSignal(int) {
+	exitRequested.store(true);
+}
+
+void installExitHandlers() {
+	struct sigaction action{};
+	action.sa_handler = onExitSignal;
+	// Slow calls during start-up (SOEM's socket I/O) resume instead of failing.
+	action.sa_flags = SA_RESTART;
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGINT, &action, nullptr);
+	sigaction(SIGTERM, &action, nullptr);
+}
+
+// Margin past the driver's own deadline before the bus is released anyway:
+// covers the settle and disable phases and an EtherCAT loop that stalls.
+constexpr double kStopBackstopMarginSec = 1.0;
+
+// Asks the modules to bring the drives to rest, then waits while the
+// EtherCAT loop does it. Telemetry keeps flowing meanwhile; commands do not
+// (nothing is spun, and the driver ignores them once stopping).
+void stopDrives(rclcpp::Node::SharedPtr nh, kelo::EtherCATMaster* master,
+	const std::vector<kelo::EtherCATModuleROS*>& rosModules) {
+	if (master->hasStopped())
+		return;
+	const double timeoutSec = nh->has_parameter("stop_timeout") ?
+		nh->get_parameter("stop_timeout").as_double() : kelo::DriverLimits().stopTimeoutSec;
+	RCLCPP_WARN(nh->get_logger(), "Exiting: ramping the wheels to zero before releasing the drives (at most %.1f s)",
+		timeoutSec);
+	master->requestStop();
+
+	const auto deadline = std::chrono::steady_clock::now() +
+		std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+			std::chrono::duration<double>(timeoutSec + kStopBackstopMarginSec));
+	rclcpp::WallRate rate(20.0);
+	while (!master->hasStopped() && std::chrono::steady_clock::now() < deadline) {
+		for (size_t i = 0; i < rosModules.size(); i++)
+			rosModules[i]->step();
+		rate.sleep();
+	}
+	if (master->hasStopped())
+		RCLCPP_INFO(nh->get_logger(), "Drives stopped and disabled");
+	else
+		RCLCPP_ERROR(nh->get_logger(), "The EtherCAT loop did not finish the stop in time; releasing the bus");
+}
+
+}  // namespace
 
 // create and configure one module
 kelo::EtherCATModuleROS* createModule(rclcpp::Node::SharedPtr nh, std::string moduleType, std::string moduleName, std::string configTag) {
@@ -115,7 +176,8 @@ void stepModules(const rclcpp::TimerEvent&) {
 
 int main (int argc, char** argv)
 {
-	rclcpp::init(argc, argv);
+	rclcpp::init(argc, argv, rclcpp::InitOptions(), rclcpp::SignalHandlerOptions::None);
+	installExitHandlers();
 	auto nh = rclcpp::Node::make_shared("platform_driver");
 
 	nh->declare_parameter("modules.list", std::vector<std::string>{}); 
@@ -192,7 +254,7 @@ int main (int argc, char** argv)
 
 	// initialize EtherCAT
 	while (!master->initEthercat()) {
-		if (delayRetry == 0) {
+		if (delayRetry == 0 || exitRequested.load()) {
 			RCLCPP_ERROR(nh->get_logger(), "Failed to initialize EtherCAT");
 			return -1;
 		}
@@ -200,10 +262,10 @@ int main (int argc, char** argv)
 		std::this_thread::sleep_for(std::chrono::seconds(delayRetry));
 	}
 	
-	// ROS main loop
-	rclcpp::Rate rate(20.0f); // hz
+	// ROS main loop. WallRate: a wall-clock step must not stall it.
+	rclcpp::WallRate rate(20.0); // hz
 	int exitStatus = 0;
-	while (rclcpp::ok()) {
+	while (rclcpp::ok() && !exitRequested.load()) {
 		const bool reinitAttempted = enableEthercatRecovery && master->needsReinit();
 		const bool reinitSucceeded = reinitAttempted && master->reinitializeEthercat();
 		const kelo::LoopVerdict verdict =
@@ -224,6 +286,12 @@ int main (int argc, char** argv)
 		
 		rate.sleep();
 	}
+
+	// An orderly exit: the drives have no brakes, so they are brought to rest
+	// before the master releases them. After an EtherCAT failure there is no
+	// loop left to do it.
+	if (exitStatus == 0)
+		stopDrives(nh, master, rosModules);
 
 	// The master's loop steps the modules, so it stops (and flushes the black
 	// box) before they go.
