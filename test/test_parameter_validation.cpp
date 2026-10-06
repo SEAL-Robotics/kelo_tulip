@@ -146,6 +146,23 @@ TEST(WheelModelErrors, eachFieldIsChecked) {
 	}
 }
 
+// The KD165 takes its torque limits normalised to the motor's maximum; any
+// value above 1 makes it discard the frame and freewheel both motors.
+TEST(WheelModelErrors, aCurrentLimitAboveFullTorqueIsRejected) {
+	for (const double bad : {1.01, 10.0, 20.0, 40.0}) {
+		WheelModel m = kd165();
+		m.currentlimit = bad;
+		EXPECT_TRUE(mentions(kelo::wheelModelErrors(m), "currentlimit")) << bad;
+	}
+}
+
+TEST(WheelModelErrors, fullTorqueAndAFreewheelingStandbyAreAccepted) {
+	WheelModel m = kd165();
+	m.currentlimit = 1.0;
+	m.standbycurrent = 0.0;
+	EXPECT_TRUE(kelo::wheelModelErrors(m).empty());
+}
+
 TEST(WheelModelErrors, standbyCurrentAboveTheCurrentLimitIsRejected) {
 	WheelModel m = kd165();
 	m.standbycurrent = 1.0;

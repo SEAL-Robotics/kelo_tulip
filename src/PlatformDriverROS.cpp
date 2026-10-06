@@ -348,8 +348,8 @@ void PlatformDriverROS::readWheelModels() {
 		nh->declare_parameter(prefix + "wheeldistance", 0.08);
 		nh->declare_parameter(prefix + "canPivot", true);
 		nh->declare_parameter(prefix + "velocitylimit", 100.0);
-		nh->declare_parameter(prefix + "currentlimit", 10.0);
-		nh->declare_parameter(prefix + "standbycurrent", 1.0);
+		nh->declare_parameter(prefix + "currentlimit", 1.0);
+		nh->declare_parameter(prefix + "standbycurrent", 0.1);
 
 		WheelModel wm;
 		wm.name = name;

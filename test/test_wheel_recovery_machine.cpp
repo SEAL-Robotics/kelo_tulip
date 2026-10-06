@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdint>
 
 #include "kelo_tulip/WheelRecovery.h"
 
@@ -32,20 +33,46 @@ struct Scenario {
 };
 
 TEST(WheelStatusSane, acceptsTheValuesSeenOnAHealthyOrReturningDrive) {
-	EXPECT_TRUE(kelo::wheelStatusSane(63));
-	EXPECT_TRUE(kelo::wheelStatusSane(61));
-	// Seen on a slave coming back from a dropout; the grip bit is meaningless here.
-	EXPECT_TRUE(kelo::wheelStatusSane(4157));
+	EXPECT_TRUE(kelo::wheelStatusSane(63, 2051));
+	EXPECT_TRUE(kelo::wheelStatusSane(61, 2051));
+	// MOTOR_STOP with the EtherCAT watchdog latched: every slave back from a
+	// dropout reports it, and the disable-enable clears it.
+	EXPECT_TRUE(kelo::wheelStatusSane(4157, 2051));
 }
 
 TEST(WheelStatusSane, rejectsFaultBitsAndAnUnresponsiveDrive) {
-	EXPECT_FALSE(kelo::wheelStatusSane(0));
-	// 125 (61 with 0x40 set) was seen when a wheel's supply collapsed.
-	EXPECT_FALSE(kelo::wheelStatusSane(125));
-	EXPECT_FALSE(kelo::wheelStatusSane(63 | 0x80));
-	EXPECT_FALSE(kelo::wheelStatusSane(63 | 0x100));
-	EXPECT_FALSE(kelo::wheelStatusSane(63 | 0x200));
-	EXPECT_FALSE(kelo::wheelStatusSane(63 | 0x400));
+	EXPECT_FALSE(kelo::wheelStatusSane(0, 2051));
+	// 125 (LOW_VOLTAGE_ERR) was seen when a wheel's supply collapsed.
+	EXPECT_FALSE(kelo::wheelStatusSane(125, 2051));
+	for (const std::uint16_t bit : {0x0040, 0x0080, 0x0100, 0x0200, 0x0400})
+		EXPECT_FALSE(kelo::wheelStatusSane(static_cast<std::uint16_t>(63 | bit), 2051)) << std::hex << bit;
+}
+
+TEST(WheelStatusSane, rejectsTheSafetyNetAndEncoderErrors) {
+	// OVER_SPEED_ERR, M2_ENC_ERR, M1_ENC_ERR, RED_ENC_ERR.
+	for (const std::uint16_t bit : {0x0800, 0x2000, 0x4000, 0x8000})
+		EXPECT_FALSE(kelo::wheelStatusSane(static_cast<std::uint16_t>(63 | bit), 2051)) << std::hex << bit;
+	// 32829 (RED_ENC_ERR) followed a supply collapse.
+	EXPECT_FALSE(kelo::wheelStatusSane(32829, 2051));
+}
+
+TEST(WheelStatusSane, rejectsAClearedOkFlag) {
+	// OSSD_OK, PS_OK.
+	EXPECT_FALSE(kelo::wheelStatusSane(63 & ~0x0004, 2051));
+	EXPECT_FALSE(kelo::wheelStatusSane(63 & ~0x0008, 2051));
+}
+
+TEST(WheelStatusSane, rejectsStatus2Errors) {
+	// Over/under voltage and current, board and motor temperatures, power
+	// stages, OSSD channels: every STATUS2 error bit.
+	for (int b = 2; b < 16; b++) {
+		if (b == 11)
+			continue;  // INT_SENSOR_OK
+		const auto bit = static_cast<std::uint16_t>(1u << b);
+		EXPECT_FALSE(kelo::wheelStatusSane(63, static_cast<std::uint16_t>(2051 | bit))) << "B" << b;
+	}
+	// 18435: OSSD1_ERR, seen at start (with status1 1085, EXT_DISABLE_ERR).
+	EXPECT_FALSE(kelo::wheelStatusSane(63, 18435));
 }
 
 TEST(WheelRecoveryMachine, aHealthyWheelStaysNormalAndEnabled) {

@@ -105,8 +105,8 @@ std::vector<std::string> wheelModelErrors(const WheelModel& m) {
 		openClosed(0, MAX_HUB_DISTANCE));
 	check(errors, inOpenClosed(m.velocitylimit, 0, MAX_HUB_VELOCITY), prefix + "velocitylimit", m.velocitylimit,
 		openClosed(0, MAX_HUB_VELOCITY));
-	check(errors, inOpenClosed(m.currentlimit, 0, MAX_MOTOR_CURRENT), prefix + "currentlimit", m.currentlimit,
-		openClosed(0, MAX_MOTOR_CURRENT));
+	check(errors, inOpenClosed(m.currentlimit, 0, MAX_TORQUE_LIMIT), prefix + "currentlimit", m.currentlimit,
+		openClosed(0, MAX_TORQUE_LIMIT));
 	if (std::isfinite(m.currentlimit))
 		check(errors, inClosed(m.standbycurrent, 0, m.currentlimit), prefix + "standbycurrent", m.standbycurrent,
 			closed(0, m.currentlimit));

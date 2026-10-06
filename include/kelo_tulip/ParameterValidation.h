@@ -50,7 +50,9 @@ constexpr double MAX_WHEEL_WIDTH = 0.3;          // m
 constexpr double MAX_CASTER_OFFSET = 0.2;        // m
 constexpr double MAX_HUB_DISTANCE = 0.5;         // m
 constexpr double MAX_HUB_VELOCITY = 200.0;       // rad/s
-constexpr double MAX_MOTOR_CURRENT = 40.0;       // A
+// The KD165 takes torque limits normalised to the motor's maximum; above 1 it
+// discards the whole frame and both motors freewheel.
+constexpr double MAX_TORQUE_LIMIT = 1.0;
 constexpr double MAX_WHEEL_POSITION = 10.0;      // m from the platform centre
 }  // namespace bounds
 

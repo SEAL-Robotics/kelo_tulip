@@ -14,7 +14,8 @@
 
 namespace kelo {
 
-// A KELOdrive V2 in normal operation: both motors enabled, all encoders OK.
+// A KD165 in normal operation: status1 MOTOR_RUN with OSSD and power stage OK,
+// status2 all sensors initialised, no error bit in either.
 constexpr std::uint16_t kStatus1Healthy = 63;
 constexpr std::uint16_t kStatus2Healthy = 2051;
 
@@ -57,21 +58,27 @@ enum WheelState {
 	WHEEL_LINK_LOST = 6
 };
 
-// status1 as a KELOdrive V2 reports it. Seen: 63 in normal operation; 61
-// (ENABLED2 clear) on a wheel whose second motor does not enable and on a slave
-// back from a dropout, where 4157 (0x103D) shows for a moment first; 125 (61 with
-// 0x40 set) on a wheel whose supply collapsed. 0x20, named UNDERVOLTAGE, is set in
-// normal operation and 0x40, named OVERVOLTAGE, in that power loss, so the names in
-// KeloDriveAPI.h look wrong for this firmware. Pending confirmation from KELO the
-// bits are used by value.
-constexpr std::uint16_t kStatus1FaultMask = 0x40 | 0x80 | 0x100 | 0x200 | 0x400;
-constexpr std::uint16_t kStatus1EncodersOk = 0x04 | 0x08 | 0x10;
+// Status bits per KELO's "KELO Drive KD165 Ethercat Communication" (firmware
+// KD_VA_01_22). KeloDriveAPI.h's STAT1_* names describe an older drive and do
+// not apply. STATUS1 B4 and B5 always read 1 and carry nothing.
+constexpr std::uint16_t kStatus1ErrorMask = 0xFFC0;
+constexpr std::uint16_t kStatus1OkMask = 0x000C;  // OSSD_OK, PS_OK
+constexpr std::uint16_t kStatus2ErrorMask = 0xF7FC;
+// The drive's 100 ms EtherCAT watchdog. Every slave back from a dropout has it
+// latched (status1 4157), and the disable-enable that re-tests the wheel
+// clears it, so it must not hold the wheel off.
+constexpr std::uint16_t kStatus1EcatWatchdog = 0x1000;
 
-// A drive that can be re-enabled: encoders reporting and none of the bits that
-// stand for a supply, current or temperature fault. Grip bits (0x800..0x4000)
-// are meaningless on a wheel and ignored.
-inline bool wheelStatusSane(std::uint16_t status1) {
-	return (status1 & kStatus1FaultMask) == 0 && (status1 & kStatus1EncodersOk) == kStatus1EncodersOk;
+// A drive that may be re-enabled after its slave returns: OSSD and power stage
+// OK and no error latched in either word apart from the EtherCAT watchdog. An
+// over-speed, encoder, power-stage or temperature error keeps the wheel held.
+// The STATUS2 sensor-OK flags are not required: what a slave reports for them
+// right after a dropout has not been observed. The re-test that follows still
+// needs the exact healthy pair, so a drive without them recovers no further.
+inline bool wheelStatusSane(std::uint16_t status1, std::uint16_t status2) {
+	const std::uint16_t errors1 = static_cast<std::uint16_t>(kStatus1ErrorMask & ~kStatus1EcatWatchdog);
+	return (status1 & errors1) == 0 && (status1 & kStatus1OkMask) == kStatus1OkMask &&
+		(status2 & kStatus2ErrorMask) == 0;
 }
 
 // Whether a wheel's slave is reachable. SOEM's periodic state read reports state

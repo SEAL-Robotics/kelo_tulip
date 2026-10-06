@@ -59,8 +59,8 @@ struct WheelModel {
 	double wheeldistance;    // [m] distance between centers of both hubwheels
 	bool canPivot;
 	double velocitylimit;    // [rad/s] for one hubwheel
-	double currentlimit;
-	double standbycurrent;
+	double currentlimit;     // fraction of full motor torque, 0 < x <= 1
+	double standbycurrent;   // same, while idle; 0 = freewheel
 	
 	WheelModel() {
 		name = "KELOdrive105";
@@ -71,8 +71,8 @@ struct WheelModel {
 		wheeldistance = 0.080;
 		canPivot = true;
 		velocitylimit = 100.0;
-		currentlimit = 20.0;
-		standbycurrent = 1.0;
+		currentlimit = 1.0;
+		standbycurrent = 0.1;
 	}
 };
 

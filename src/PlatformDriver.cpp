@@ -813,7 +813,7 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 	const txpdo1_t& data = processData[wheel];
 	const WheelRecoveryMachine::Input input{recoveryClockMs, operatorWants,
 		wheelNeedsRecovery(data.status1, data.status2, operatorWants), wheelLinkUp(wheel),
-		wheelStatusSane(data.status1)};
+		wheelStatusSane(data.status1, data.status2)};
 
 	const WheelRecoveryMachine::Output out = recoveryMachines[wheel].step(input);
 	recoveryAllowsEnable[wheel] = out.allowsEnable;
