@@ -196,6 +196,15 @@ TEST(OdometryFreshness, staleTwistCovarianceValidation) {
 	EXPECT_FALSE(kelo::isValidStaleTwistCovariance(std::numeric_limits<double>::infinity()));
 }
 
+TEST(OdometryFreshness, odomVarianceValidation) {
+	EXPECT_TRUE(kelo::isValidOdomVariance(1e-2));
+	EXPECT_TRUE(kelo::isValidOdomVariance(1e3));
+	EXPECT_FALSE(kelo::isValidOdomVariance(0.0));
+	EXPECT_FALSE(kelo::isValidOdomVariance(-1e-2));
+	EXPECT_FALSE(kelo::isValidOdomVariance(std::numeric_limits<double>::quiet_NaN()));
+	EXPECT_FALSE(kelo::isValidOdomVariance(std::numeric_limits<double>::infinity()));
+}
+
 TEST(OdometryFreshness, staleTwistCovarianceOnlyWhileStale) {
 	EXPECT_DOUBLE_EQ(kelo::twistCovariance(false, 1e-3, 1e6), 1e-3);
 	EXPECT_DOUBLE_EQ(kelo::twistCovariance(true, 1e-3, 1e6), 1e6);

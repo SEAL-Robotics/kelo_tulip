@@ -72,6 +72,10 @@ PlatformDriverROS::PlatformDriverROS()
 	odomy = 0;
 	odoma = 0;
 	staleTwistCovariance = 1e6;
+	// Upstream's values: rotation from the wheels effectively unknown, so an
+	// estimator takes it from an IMU. A base with no IMU should set these.
+	yawCovariance = 1e3;
+	yawRateCovariance = 1e3;
 	encoderDeltaLimit = 0.1;
 	maxHeldGap = 0.1;
 }
@@ -108,6 +112,8 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 	nh->declare_parameter("cmd_vel_timeout", cmdVelWatchdog.getTimeout());
 	nh->declare_parameter("odom_stale_ticks", OdometryFreshnessTracker::DEFAULT_STALE_TICKS);
 	nh->declare_parameter("stale_twist_covariance", staleTwistCovariance);
+	nh->declare_parameter("yaw_covariance", yawCovariance);
+	nh->declare_parameter("yaw_rate_covariance", yawRateCovariance);
 
 	// Dynamic typing so an integer in the yaml (30 for 30.0) is read, not thrown on.
 	const CurrentShapingConfig shapingDefaults;
@@ -185,6 +191,8 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 
 	const int staleTicks = nh->get_parameter("odom_stale_ticks").as_int();
 	staleTwistCovariance = nh->get_parameter("stale_twist_covariance").as_double();
+	yawCovariance = nh->get_parameter("yaw_covariance").as_double();
+	yawRateCovariance = nh->get_parameter("yaw_rate_covariance").as_double();
 
 	// A driver that moves a robot starts on a valid configuration or not at all.
 	std::vector<std::string> errors = configErrors;
@@ -199,6 +207,11 @@ bool PlatformDriverROS::init(rclcpp::Node::SharedPtr nh, std::string configPrefi
 		errors.push_back("odom_stale_ticks = " + std::to_string(staleTicks) + " is below 1");
 	if (!isValidStaleTwistCovariance(staleTwistCovariance))
 		errors.push_back("stale_twist_covariance = " + std::to_string(staleTwistCovariance) +
+			" must be finite and > 0");
+	if (!isValidOdomVariance(yawCovariance))
+		errors.push_back("yaw_covariance = " + std::to_string(yawCovariance) + " must be finite and > 0");
+	if (!isValidOdomVariance(yawRateCovariance))
+		errors.push_back("yaw_rate_covariance = " + std::to_string(yawRateCovariance) +
 			" must be finite and > 0");
 	if (!errors.empty()) {
 		for (const std::string &error : errors)
@@ -756,14 +769,14 @@ void PlatformDriverROS::publishOdometry(double vx, double vy, double va, bool wh
 	odom.pose.covariance[14] = 1e6;
 	odom.pose.covariance[21] = 1e6;
 	odom.pose.covariance[28] = 1e6;
-	odom.pose.covariance[35] = 1e3;
+	odom.pose.covariance[35] = yawCovariance;
 	odom.twist.covariance[0] = twistCovariance(wheelDataStale, 1e-3, staleTwistCovariance);
 	odom.twist.covariance[7] = twistCovariance(wheelDataStale, 1e-3, staleTwistCovariance);
 	odom.twist.covariance[8] = 0.0;
 	odom.twist.covariance[14] = 1e6;
 	odom.twist.covariance[21] = 1e6;
 	odom.twist.covariance[28] = 1e6;
-	odom.twist.covariance[35] = twistCovariance(wheelDataStale, 1e3, staleTwistCovariance);
+	odom.twist.covariance[35] = twistCovariance(wheelDataStale, yawRateCovariance, staleTwistCovariance);
 	odom.pose.pose.position.x = odomx;
 	odom.pose.pose.position.y = odomy;
 	odom.pose.pose.position.z = 0.0;

@@ -146,6 +146,12 @@ inline bool isValidStaleTwistCovariance(double value) {
 	return std::isfinite(value) && value > 0;
 }
 
+// Same rule for the yaw and yaw-rate variances the odometry reports while the
+// wheel data is fresh.
+inline bool isValidOdomVariance(double value) {
+	return std::isfinite(value) && value > 0;
+}
+
 // Zero velocity with a tight covariance tells the estimator the base is
 // definitely standing still; while the wheel data is stale that is unknown.
 inline double twistCovariance(bool stale, double normal, double staleValue) {
