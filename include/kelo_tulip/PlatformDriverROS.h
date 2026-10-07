@@ -170,6 +170,8 @@ protected:
 	std::vector<double> prev_pivot_enc;
 	std::unique_ptr<OdometryFreshnessTracker> freshnessTracker;
 	double staleTwistCovariance;
+	double yawCovariance;
+	double yawRateCovariance;
 	double encoderDeltaLimit;
 	double maxHeldGap;
 
