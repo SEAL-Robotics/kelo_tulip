@@ -48,6 +48,7 @@
 
 #include "kelo_tulip/CommandWatchdog.h"
 #include "kelo_tulip/OdometryFreshness.h"
+#include "kelo_tulip/OdometryStamp.h"
 #include "kelo_tulip/EtherCATModuleROS.h"
 #include "kelo_tulip/PlatformDriver.h"
 #include "kelo_tulip/msg/kelo_drives_input.hpp"
@@ -111,11 +112,15 @@ protected:
 	void initializeEncoderValue();
 	void calculateRobotVelocity(double& vx, double& vy, double& va, double& displacement);
 	void calculateRobotPose(double vx, double vy, double va);
-	// Velocities are zero while the wheel data is stale.
-	OdometryFreshnessTracker::Update calculateRobotVelocity2(double& vx, double& vy, double& va, double& displacement, double &dt);
+	// Velocities are zero while the wheel data is stale. windowEndNs is the
+	// host instant of the newest sample every wheel reported (kNoInstantNs
+	// without one).
+	OdometryFreshnessTracker::Update calculateRobotVelocity2(double& vx, double& vy, double& va, double& displacement,
+		double &dt, bool& everyWheelUsedEncoders, int64_t& windowEndNs);
 	void calculateRobotPose2(double vx, double vy, double va, double dt);
-	void publishOdometry(double vx, double vy, double va, bool wheelDataStale);
-	void createOdomToBaseLinkTransform(geometry_msgs::msg::TransformStamped& odom_trans);
+	void publishOdometry(double vx, double vy, double va, bool wheelDataStale, int64_t stampNs, const OdomPose& pose);
+	void createOdomToBaseLinkTransform(geometry_msgs::msg::TransformStamped& odom_trans, int64_t stampNs,
+		const OdomPose& pose);
 
 	void publishProcessDataInput();
 	void publishBattery();
@@ -178,6 +183,8 @@ protected:
 	double odomx;
 	double odomy;
 	double odoma;
+	OdometryClock odometryClock;
+	int64_t lastTfStampNs;
 	
 	rclcpp::Node::SharedPtr nh;
 };

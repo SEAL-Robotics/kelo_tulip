@@ -52,6 +52,12 @@
 
 namespace kelo {
 
+namespace {
+// The ROS read and the last capture are a frame or two apart; a gap beyond
+// this is a drive that restarted its counter.
+constexpr int64_t kMaxSampleGapNs = 100 * 1000 * 1000;
+}  // namespace
+
 PlatformDriverROS::PlatformDriverROS()
 	: driver(NULL)
 	, odom_broadcaster(nullptr)
@@ -71,6 +77,7 @@ PlatformDriverROS::PlatformDriverROS()
 	odomx = 0;
 	odomy = 0;
 	odoma = 0;
+	lastTfStampNs = kNoInstantNs;
 	staleTwistCovariance = 1e6;
 	// Upstream's values: rotation from the wheels effectively unknown, so an
 	// estimator takes it from an IMU. A base with no IMU should set these.
@@ -285,8 +292,11 @@ bool PlatformDriverROS::step() {
 
 	//calculate robot velocity
 	double vx, vy, va, displacement, dt;
+	bool everyWheelUsedEncoders = false;
+	int64_t windowEndNs = kNoInstantNs;
 	//calculateRobotVelocity(vx, vy, va, displacement);
-	OdometryFreshnessTracker::Update freshness = calculateRobotVelocity2(vx, vy, va, displacement, dt);
+	OdometryFreshnessTracker::Update freshness = calculateRobotVelocity2(vx, vy, va, displacement, dt,
+		everyWheelUsedEncoders, windowEndNs);
 	// Without fresh wheel data the velocities are zero and the pose does not
 	// move: reporting the frozen last motion would drift the state estimator.
 	if (freshness.noDataWarning)
@@ -298,19 +308,26 @@ bool PlatformDriverROS::step() {
 
 	//calculate robot displacement and current pose
 	//calculateRobotPose(vx, vy, va);
+	const OdomPose stepStart{odomx, odomy, odoma};
 	calculateRobotPose2(vx, vy, va, dt);
 
-		
-	//publish the odometry
-	publishOdometry(vx, vy, va, holdOdometry(freshness.stale, freshness.noNewSample));
+	// Stamped at the instant the twist describes, from the samples' own
+	// instants rather than when this loop happens to run.
+	const bool held = holdOdometry(freshness.stale, freshness.noNewSample);
+	const OdometryClock::Stamp stamp = odometryClock.next(twistSource(held, everyWheelUsedEncoders), windowEndNs, dt,
+		nh->get_clock()->now().nanoseconds());
+	const OdomPose stampedPose = integratePose(stepStart, vx, vy, va, stamp.poseFraction * dt);
+	publishOdometry(vx, vy, va, held, stamp.ns, stampedPose);
 
 	// publish_tf defaults false so the driver never competes with a separate
 	// state estimator for odom -> base_footprint. Enable it only for bench
-	// testing or standalone use.
-	if (publishTf) {
+	// testing or standalone use. A held step repeats the last stamp, which tf2
+	// would reject as redundant.
+	if (publishTf && stamp.ns != lastTfStampNs) {
 		geometry_msgs::msg::TransformStamped odom_trans;
-		createOdomToBaseLinkTransform(odom_trans);
+		createOdomToBaseLinkTransform(odom_trans, stamp.ns, stampedPose);
 		odom_broadcaster->sendTransform(odom_trans);
+		lastTfStampNs = stamp.ns;
 	}
 
 /*
@@ -599,7 +616,8 @@ void PlatformDriverROS::calculateRobotPose(double vx, double vy, double va) {
 	odoma = norm(odoma + va * dt);
 }
 
-OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& va, double& displacement, double &dt) {
+OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& va,
+	double& displacement, double &dt, bool& everyWheelUsedEncoders, int64_t& windowEndNs) {
 	dt = LOOP_PERIOD_SEC; // Target delta time. Replaced by real delta from sensor timestamps, when available.
 	std::vector<double> rx;
 	rx.resize(nWheels, 0);
@@ -618,9 +636,13 @@ OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(doub
 	};
 	std::vector<Sample> samples(nWheels);
 	std::vector<uint64_t> timestamps(nWheels);
+	std::vector<int64_t> wheelInstantsNs(nWheels, kNoInstantNs);
 	for (int i = 0; i < nWheels; i++) {
 		volatile txpdo1_t* swData = driver->getWheelProcessData(i);
 		Sample& sm = samples[i];
+		SampleInstant captured;
+		SampleInstant attempt;
+		bool haveCapture = false;
 		int repcnt = 3;
 		// read mutiple times if data has changed while reading
 		do
@@ -632,9 +654,17 @@ OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(doub
 			sm.velocity_1 = swData->velocity_1;
 			sm.velocity_2 = swData->velocity_2;
 			sm.velocity_pivot = swData->velocity_pivot;
+			if (driver->getSampleInstant(i, attempt)) {
+				captured = attempt;
+				haveCapture = true;
+			}
 		} while ((sm.sensor_ts != swData->sensor_ts) && --repcnt);
 		timestamps[i] = sm.sensor_ts;
+		if (haveCapture)
+			wheelInstantsNs[i] = sampleInstantNs(captured, sm.sensor_ts, kMaxSampleGapNs);
 	}
+	windowEndNs = commonSampleInstantNs(wheelInstantsNs);
+	everyWheelUsedEncoders = true;
 	OdometryFreshnessTracker::Update freshness = freshnessTracker->update(timestamps);
 
 	double encoderDt = 0.0;
@@ -654,6 +684,7 @@ OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(doub
 			wl = velocity_1;
 			wr = -velocity_2;
 			wp = velocity_pivot;
+			everyWheelUsedEncoders = false;
 			double fallbackDt = fallbackDtSec(delta_ts, freshness.resync, maxHeldGap, LOOP_PERIOD_SEC);
 			if (fallbackDt > encoderDt) encoderDt = fallbackDt;
 		}
@@ -743,23 +774,18 @@ OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(doub
 }
 
 void PlatformDriverROS::calculateRobotPose2(double vx, double vy, double va, double dt) {
-	double dx = vx * dt;
-	double dy = vy * dt;
-	// simplify circle movement by line between last and current location
-	double a_average = norm(odoma + (0.5 * va * dt));
-	double sin_a = sin(a_average);
-	double cos_a = cos(a_average);
-	// transform displacement to odom frame
-	odomx += (dx * cos_a) - (dy * sin_a);
-	odomy += (dx * sin_a) + (dy * cos_a);
-	odoma = norm(odoma + (va * dt));
+	const OdomPose next = integratePose(OdomPose{odomx, odomy, odoma}, vx, vy, va, dt);
+	odomx = next.x;
+	odomy = next.y;
+	odoma = next.a;
 }
 
-void PlatformDriverROS::publishOdometry(double vx, double vy, double va, bool wheelDataStale) {
+void PlatformDriverROS::publishOdometry(double vx, double vy, double va, bool wheelDataStale, int64_t stampNs,
+	const OdomPose& pose) {
 	tf2::Quaternion odom_quat;
-	odom_quat.setRPY(0, 0, odoma);
+	odom_quat.setRPY(0, 0, pose.a);
 	nav_msgs::msg::Odometry odom;
-	odom.header.stamp = nh->get_clock()->now();
+	odom.header.stamp = rclcpp::Time(stampNs, nh->get_clock()->get_clock_type());
 	//odom.header.seq = sequence_id++;
 	odom.header.frame_id = odomFrame;
 	odom.child_frame_id = baseFrame;
@@ -777,8 +803,8 @@ void PlatformDriverROS::publishOdometry(double vx, double vy, double va, bool wh
 	odom.twist.covariance[21] = 1e6;
 	odom.twist.covariance[28] = 1e6;
 	odom.twist.covariance[35] = twistCovariance(wheelDataStale, yawRateCovariance, staleTwistCovariance);
-	odom.pose.pose.position.x = odomx;
-	odom.pose.pose.position.y = odomy;
+	odom.pose.pose.position.x = pose.x;
+	odom.pose.pose.position.y = pose.y;
 	odom.pose.pose.position.z = 0.0;
 	odom.pose.pose.orientation = tf2::toMsg(odom_quat);	
 	odom.twist.twist.linear.x = vx;
@@ -787,14 +813,15 @@ void PlatformDriverROS::publishOdometry(double vx, double vy, double va, bool wh
 	odomPublisher->publish(odom);
 }
 		
-void PlatformDriverROS::createOdomToBaseLinkTransform(geometry_msgs::msg::TransformStamped& odom_trans) {
+void PlatformDriverROS::createOdomToBaseLinkTransform(geometry_msgs::msg::TransformStamped& odom_trans,
+	int64_t stampNs, const OdomPose& pose) {
 	tf2::Quaternion odom_quat;
-	odom_quat.setRPY(0, 0, odoma);
-	odom_trans.header.stamp = nh->get_clock()->now();
+	odom_quat.setRPY(0, 0, pose.a);
+	odom_trans.header.stamp = rclcpp::Time(stampNs, nh->get_clock()->get_clock_type());
 	odom_trans.header.frame_id = odomFrame;
 	odom_trans.child_frame_id = baseFrame;
-	odom_trans.transform.translation.x = odomx;
-	odom_trans.transform.translation.y = odomy;
+	odom_trans.transform.translation.x = pose.x;
+	odom_trans.transform.translation.y = pose.y;
 	odom_trans.transform.translation.z = 0.0;
 	odom_trans.transform.rotation = tf2::toMsg(odom_quat);
 }

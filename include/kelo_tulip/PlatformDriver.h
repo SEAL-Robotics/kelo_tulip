@@ -63,6 +63,7 @@ extern "C" {
 #include "kelo_tulip/WheelConfig.h"
 #include "kelo_tulip/WheelRecovery.h"
 #include "kelo_tulip/EthercatBlackBox.h"
+#include "kelo_tulip/SampleInstant.h"
 #include "kelo_tulip/StopSequence.h"
 #include "kelo_tulip/VelocityCommand.h"
 #include <boost/thread.hpp>
@@ -166,6 +167,10 @@ public:
 
 	std::vector<double> getEncoderValue(int idx);
 
+	//! Thread-safe: the host instant of the wheel's latest sample. False
+	//! before its first sample, or when the read kept overlapping a write.
+	bool getSampleInstant(unsigned int wheel, SampleInstant& out) const;
+
 	void SetState(int wheel, uint16_t state);
 		
 protected:
@@ -191,6 +196,10 @@ protected:
 	void recordBlackBoxSample();
 	// Wall time since construction; only its steps feed the recovery clock.
 	virtual double nowMs() const;
+	// The clock the ROS side stamps messages with (CLOCK_REALTIME), in ns:
+	// ROS time without a simulated clock, which a hardware driver never runs on.
+	virtual int64_t hostNowNs() const;
+	void captureSampleInstants();
 	void advanceRecoveryClock();
 	bool anyWheelFailed() const;
 	void applyWheelEnable(unsigned int wheel);
@@ -289,6 +298,13 @@ protected:
 	double stopVaDec = 0.8;
 	std::atomic<bool> stopRequestedFlag{false};
 	StopSequence stopSequence;
+
+	// Owned by the EtherCAT thread. initEtherCAT forgets the send instant while
+	// that thread is stopped; a sample still in the process image across a
+	// re-init keeps the instant it was captured with.
+	int64_t frameSentNs = kNoInstantNs;
+	std::vector<uint64_t> capturedSensorTs;
+	std::unique_ptr<SampleInstantSlot[]> sampleInstants;
 
 private:
 	PlatformDriver(const PlatformDriver&);

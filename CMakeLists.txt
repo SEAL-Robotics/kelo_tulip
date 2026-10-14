@@ -259,6 +259,13 @@ if(BUILD_TESTING)
 	target_link_libraries(test_parameter_validation tulip_library)
 	ament_add_gtest(test_platform_driver_stop test/test_platform_driver_stop.cpp)
 	target_link_libraries(test_platform_driver_stop tulip_library)
+	ament_add_gtest(test_sample_instant test/test_sample_instant.cpp)
+	target_link_libraries(test_sample_instant pthread)
+	ament_add_gtest(test_odometry_stamp test/test_odometry_stamp.cpp)
+	ament_add_gtest(test_platform_driver_sample_instant test/test_platform_driver_sample_instant.cpp)
+	target_link_libraries(test_platform_driver_sample_instant tulip_library)
+	ament_add_gtest(test_platform_driver_ros_odometry test/test_platform_driver_ros_odometry.cpp)
+	target_link_libraries(test_platform_driver_ros_odometry tulip_library)
 
 	# Tests never join a live robot's DDS network: a shell on a robot, or a
 	# laptop on its LAN, may carry that robot's domain and peer list. Every

@@ -69,6 +69,10 @@ namespace {
 // not keep driving on the rest. The ramp keeps a stop from being an instantaneous
 // zero; the drive's current limit bounds the braking torque either way.
 constexpr float kHoldSetpointStep = 0.05f;
+// A frame is read about one cycle after it is sent, and a stalled cycle still
+// reads the frame it sent: a gap this long is a step of the clock, not a
+// frame in flight.
+constexpr int64_t kMaxFrameInFlightNs = 500 * 1000 * 1000;
 }  // namespace
 
 PlatformDriver::PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, const std::vector<WheelData>& wheelData)
@@ -138,6 +142,8 @@ PlatformDriver::PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, con
 	setpointSlew.resize(2 * nWheels);
 	wheelSetpoints.assign(2 * nWheels, 0.0f);
 	releaseStep = kHoldSetpointStep;
+	capturedSensorTs.assign(nWheels, 0);
+	sampleInstants.reset(new SampleInstantSlot[nWheels]);
 }
 
 PlatformDriver::~PlatformDriver() {
@@ -154,6 +160,8 @@ bool PlatformDriver::initEtherCAT2(ecx_contextt* ecx_context, int ecx_slavecount
 
 bool PlatformDriver::initEtherCAT(ec_slavet* ecx_slaves, int ecx_slavecount) {
 	this->ecx_slaves = ecx_slaves;
+	// The (re)start sends frames of its own before the loop runs.
+	frameSentNs = kNoInstantNs;
 
 	std::cout << "PlatformDriver InitEtherCAT\n";
 	for (unsigned int i = 0; i < wheelConfigs.size(); i++) {
@@ -177,6 +185,8 @@ bool PlatformDriver::initEtherCAT(ec_slavet* ecx_slaves, int ecx_slavecount) {
 bool PlatformDriver::step() {
 	const bool keepRunning = stepStateMachine();
 	recordBlackBoxSample();
+	// The master sends the next frame as soon as the modules have stepped.
+	frameSentNs = hostNowNs();
 	return keepRunning;
 }
 
@@ -185,6 +195,7 @@ bool PlatformDriver::stepStateMachine() {
 	lastProcessData = processData;
 	for (int i = 0; i < nWheels; i++)
 		processData[i] = *getWheelProcessData(i);
+	captureSampleInstants();
 
 	// TODO check if should take timestamp differently, or from each wheel separately
 	if (nWheels > 0)
@@ -471,6 +482,12 @@ void PlatformDriver::setWheelProcessData(unsigned int wheel, rxpdo1_t* data) {
 	int slave = wheelConfigs[wheel].ethercatNumber;
 	rxpdo1_t* ecData = (rxpdo1_t*) ecx_slaves[slave].outputs;
 	*ecData = *data;
+}
+
+bool PlatformDriver::getSampleInstant(unsigned int wheel, SampleInstant& out) const {
+	if (wheel >= static_cast<unsigned int>(nWheels))
+		return false;
+	return sampleInstants[wheel].read(out);
 }
 
 std::vector<double> PlatformDriver::getEncoderValue(int idx) {
@@ -792,6 +809,25 @@ void PlatformDriver::advanceRecoveryClock() {
 
 double PlatformDriver::nowMs() const {
 	return std::chrono::duration<double, std::milli>(RecoveryClock::now() - clockStart).count();
+}
+
+int64_t PlatformDriver::hostNowNs() const {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// A drive whose counter moved delivered a new sample in the frame just read.
+void PlatformDriver::captureSampleInstants() {
+	int64_t frameNs = kNoInstantNs;
+	for (int i = 0; i < nWheels; i++) {
+		const uint64_t sensorTs = processData[i].sensor_ts;
+		if (sensorTs == capturedSensorTs[i])
+			continue;
+		if (frameNs == kNoInstantNs)
+			frameNs = frameInstantNs(frameSentNs, hostNowNs(), kMaxFrameInFlightNs);
+		capturedSensorTs[i] = sensorTs;
+		sampleInstants[i].publish(SampleInstant{sensorTs, frameNs});
+	}
 }
 
 bool PlatformDriver::wheelLinkUp(unsigned int wheel) {

@@ -19,6 +19,9 @@
 >   the drives;
 > - the joypad no longer drives the wheels; `/cmd_vel` is the only velocity input;
 > - configurable `odom_frame` / `base_frame`, and `publish_tf` (default off);
+> - odometry stamped at the moment its twist describes, from the instants the
+>   EtherCAT frames carried the drives' samples, with the pose taken to that
+>   moment; not at the moment the ROS loop happens to publish;
 > - the EtherCAT thread really runs with `SCHED_FIFO`;
 > - KELOdrive V2 automatic wheel recovery that never re-enables a wheel disabled
 >   through `setWheelsEnable`, disables a wheel it gives up on, and uses a
@@ -239,7 +242,17 @@ On the `seal` branch the joypad does not drive the wheels: `/cmd_vel` is the onl
 
 On the topic `/odom` odometry data in form of [`nav_msgs/Odometry`](https://docs.ros2.org/foxy/api/nav_msgs/msg/Odometry.html) are published. Each time the program is started, the position is reset to the origin.
 
-With `publish_tf` set to true (default false), the same odometry is also published on `/tf` as the transform `odom_frame` → `base_frame` (defaults `odom` → `base_footprint`). Leave it off when another node, such as a state estimator, owns that transform.
+The message is published at 20 Hz, but its stamp is the moment its twist describes, on the host clock (`CLOCK_REALTIME`, which ROS time reads; the driver never runs on a simulated clock), and its pose is the pose at that moment:
+
+- **Sample instants.** A drive stamps its samples with its own counter (`sensor_ts`, ns since its power-up), which no other clock shares. The 1 kHz EtherCAT cycle therefore notes, for each drive whose counter moved, the host instant the frame carrying the new sample was sent: a frame picks up the inputs as it passes the drives, then waits about a cycle before it is read. That instant is late only by how long the drive held its sample. The first frame after a start or re-initialisation has only its arrival instant.
+- **Encoder velocities** are the mean over the window from the last used sample to the newest one (normally 50 ms). Under constant acceleration that is the velocity at the window's midpoint, so the message is stamped there, half the window (measured with the drives' counters) before the newest sample, and its pose is integrated over the first half of the window. The window ends at the newest sample every drive has reported.
+- **Drive velocities** (the drives' own velocity readings, used after stale data, across a gap too long for encoder deltas, or when any drive has no usable encoder delta) are stamped at the newest sample, with the pose integrated up to it.
+- **Held odometry** (stale or repeated wheel data: zero twist, `stale_twist_covariance`) keeps the stamp of the last used sample, where the frozen pose is. Consecutive held messages repeat it, so the stamp's age shows how long the wheel data has been missing.
+- Before any sample has been seen, the node's clock stamps the message.
+
+A message is thus stamped about half a window, roughly 25 ms, before it is published. A filter that fuses it should accept measurements that old (in robot_localization, `smooth_lagged_data` with a `history_length` longer than that delay). Stamps never run backwards except when the host clock is stepped.
+
+With `publish_tf` set to true (default false), the same odometry is also published on `/tf` as the transform `odom_frame` → `base_frame` (defaults `odom` → `base_footprint`), with the message's stamp and pose; a held step, which repeats the stamp, does not repeat the transform. Leave it off when another node, such as a state estimator, owns that transform.
 
 #### /status
 
