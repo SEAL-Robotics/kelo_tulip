@@ -21,6 +21,12 @@ struct OdomPose {
 	double a = 0.0;
 };
 
+struct PlanarTwist {
+	double vx = 0.0;
+	double vy = 0.0;
+	double va = 0.0;
+};
+
 inline double wrapAngle(double a) {
 	// The loops would never end on an infinity.
 	if (!std::isfinite(a))

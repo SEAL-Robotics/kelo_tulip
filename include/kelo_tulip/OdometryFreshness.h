@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace kelo {
@@ -127,15 +128,37 @@ inline double encoderDeltaLimitSec(int staleTicks, double loopPeriodSec, double 
 	return debounceLimit < aliasingLimitSec ? debounceLimit : aliasingLimitSec;
 }
 
-// Time the drive velocities are integrated over when the encoder deltas are
-// not used. A short gap without resync is motion the pose skipped and is
-// recovered. A resync follows an outage, and a gap beyond what the debounce
+// Whether the drive velocities are integrated over the measured gap since the
+// last used sample. A short gap without resync is motion the pose skipped and
+// is recovered. A resync follows an outage, and a gap beyond what the debounce
 // can produce (a drive re-init, a clock step, a wrapped timestamp) is not
-// motion the pose skipped: neither is integrated beyond one period.
+// motion the pose skipped: neither is integrated beyond one nominal period.
+inline bool fallbackSpansMeasuredGap(double gapSec, bool resync, double maxGapSec) {
+	return !resync && gapSec > 0.0 && gapSec <= maxGapSec;
+}
+
+// Time the drive velocities are integrated over when the encoder deltas are
+// not used.
 inline double fallbackDtSec(double gapSec, bool resync, double maxGapSec, double loopPeriodSec) {
-	if (resync || !(gapSec > 0.0) || gapSec > maxGapSec)
-		return loopPeriodSec;
-	return gapSec;
+	return fallbackSpansMeasuredGap(gapSec, resync, maxGapSec) ? gapSec : loopPeriodSec;
+}
+
+struct PlanarVelocity {
+	double x = 0.0;
+	double y = 0.0;
+};
+
+// The drives' velocities are readings at an instant, not means over a step.
+// Over a measured gap the mean of the readings at its two ends integrates a
+// constant acceleration exactly (as far as each reading belongs to its
+// sample), where the newest alone is off by a * dt^2 / 2, an error that
+// follows the velocity. A nominal period has no sampled start, and the
+// reading before an outage is stale: only the newest reading counts there.
+inline PlanarVelocity fallbackIntegrationVelocity(const std::optional<PlanarVelocity>& atGapStart,
+	const PlanarVelocity& newest, bool spansMeasuredGap) {
+	if (!spansMeasuredGap || !atGapStart)
+		return newest;
+	return PlanarVelocity{0.5 * (atGapStart->x + newest.x), 0.5 * (atGapStart->y + newest.y)};
 }
 
 inline bool isEncoderDeltaUsable(double deltaSec, bool resync, double limitSec) {

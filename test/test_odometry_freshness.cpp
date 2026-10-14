@@ -174,6 +174,47 @@ TEST(OdometryFreshness, resyncDtIsTheLoopPeriodWhateverTheGap) {
 	EXPECT_DOUBLE_EQ(kelo::fallbackDtSec(5.0, true, maxGap, PERIOD), PERIOD);
 }
 
+TEST(OdometryFreshness, aFallbackSpansTheMeasuredGapExactlyWhenItsDtIsTheGap) {
+	const double maxGap = 3 * PERIOD + 0.5 * PERIOD;
+	const double gaps[] = {0.0, 0.03, PERIOD, 0.1, maxGap, 0.2, 5.0};
+	for (const bool resync : {false, true}) {
+		for (const double gap : gaps) {
+			const bool spans = kelo::fallbackSpansMeasuredGap(gap, resync, maxGap);
+			EXPECT_EQ(spans, !resync && gap > 0.0 && gap <= maxGap) << "gap " << gap << " resync " << resync;
+			if (spans)
+				EXPECT_DOUBLE_EQ(kelo::fallbackDtSec(gap, resync, maxGap, PERIOD), gap) << "gap " << gap;
+			else
+				EXPECT_DOUBLE_EQ(kelo::fallbackDtSec(gap, resync, maxGap, PERIOD), PERIOD) << "gap " << gap;
+		}
+	}
+}
+
+TEST(OdometryFreshness, aFallbackOverAMeasuredGapIntegratesConstantAccelerationExactly) {
+	const kelo::PlanarVelocity v0{0.2, -0.1};
+	const double ax = 4.0, ay = 1.0, dt = 0.1;
+	const kelo::PlanarVelocity newest{v0.x + ax * dt, v0.y + ay * dt};
+	const kelo::PlanarVelocity v = kelo::fallbackIntegrationVelocity(v0, newest, true);
+	EXPECT_NEAR(v.x * dt, v0.x * dt + 0.5 * ax * dt * dt, 1e-12);
+	EXPECT_NEAR(v.y * dt, v0.y * dt + 0.5 * ay * dt * dt, 1e-12);
+}
+
+TEST(OdometryFreshness, aNominalPeriodIntegratesOnlyTheNewestReading) {
+	// After a resync the reading before the outage is stale, and the step's
+	// start was never sampled.
+	const kelo::PlanarVelocity beforeOutage{1.5, 0.3};
+	const kelo::PlanarVelocity newest{0.2, 0.0};
+	const kelo::PlanarVelocity v = kelo::fallbackIntegrationVelocity(beforeOutage, newest, false);
+	EXPECT_DOUBLE_EQ(v.x, newest.x);
+	EXPECT_DOUBLE_EQ(v.y, newest.y);
+}
+
+TEST(OdometryFreshness, withoutAReadingAtTheGapsStartOnlyTheNewestCounts) {
+	const kelo::PlanarVelocity newest{0.4, -0.2};
+	const kelo::PlanarVelocity v = kelo::fallbackIntegrationVelocity(std::nullopt, newest, true);
+	EXPECT_DOUBLE_EQ(v.x, newest.x);
+	EXPECT_DOUBLE_EQ(v.y, newest.y);
+}
+
 TEST(OdometryFreshness, encoderDeltaUsability) {
 	const double limit = 0.175;
 	EXPECT_TRUE(kelo::isEncoderDeltaUsable(0.05, false, limit));

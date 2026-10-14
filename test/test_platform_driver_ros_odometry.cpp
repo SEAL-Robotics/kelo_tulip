@@ -40,12 +40,16 @@ public:
 	}
 
 	// The frame sent at sentNs carries this sample; the next cycle reads it.
-	void frame(int64_t sentNs, uint64_t sensorTs, float encoder1, float encoder2) {
+	// velocity1/2 are the drive's own hub speed readings.
+	void frame(int64_t sentNs, uint64_t sensorTs, float encoder1, float encoder2, float velocity1 = 0.0f,
+		float velocity2 = 0.0f) {
 		bus()->hostNs = sentNs;
 		bus()->step();
 		inputs.sensor_ts = sensorTs;
 		inputs.encoder_1 = encoder1;
 		inputs.encoder_2 = encoder2;
+		inputs.velocity_1 = velocity1;
+		inputs.velocity_2 = velocity2;
 		bus()->hostNs = sentNs + MS;
 		bus()->step();
 	}
@@ -140,6 +144,67 @@ TEST_F(PlatformDriverROSOdometry, eachMessageIsStampedAtTheInstantItsTwistAndPos
 	EXPECT_GT(std::fabs(travelled), 1e-3);
 	EXPECT_NEAR(window.pose.pose.position.x, first.pose.pose.position.x + 0.5 * travelled, 1e-9);
 	EXPECT_NEAR(travelled, window.twist.twist.linear.x * 1e-9 * WINDOW_NS, 1e-9);
+}
+
+// Encoder deltas over 100 ms exceed this wheel's aliasing limit (about 88 ms
+// for the one-wheel fixture), so after one held step the driver falls back to
+// the drives' readings. One wheel at zero pivot angle drives straight along x.
+TEST_F(PlatformDriverROSOdometry, aFallbackOverAGapIntegratesTheMeanOfTheReadingsAtItsEnds) {
+	driverRos.frame(T0, S0, 0.0f, 0.0f);
+	const nav_msgs::msg::Odometry start = rosStep();
+	rosStep();  // held: no new sample
+
+	// From rest to the newest reading under constant acceleration.
+	const int64_t sent = T0 + 100 * MS;
+	driverRos.frame(sent, S0 + 2 * WINDOW_NS, 1.0f, -1.0f, 12.0f, -12.0f);
+	const nav_msgs::msg::Odometry fallback = rosStep();
+	EXPECT_EQ(ns(fallback.header.stamp), sent);
+	EXPECT_GT(std::fabs(fallback.twist.twist.linear.x), 0.1);
+	EXPECT_DOUBLE_EQ(fallback.twist.twist.linear.y, 0.0);
+	EXPECT_DOUBLE_EQ(fallback.pose.pose.orientation.z, 0.0);
+	const double gap = 2e-9 * WINDOW_NS;
+	EXPECT_NEAR(fallback.pose.pose.position.x - start.pose.pose.position.x,
+		0.5 * (0.0 + fallback.twist.twist.linear.x) * gap, 1e-9);
+}
+
+class PlatformDriverROSResync : public PlatformDriverROSOdometry {
+protected:
+	// Driving fast, then the wheel data goes stale: the last reading before
+	// the outage is 20 rad/s on each hub.
+	nav_msgs::msg::Odometry driveThenGoStale() {
+		driverRos.frame(T0, S0, 0.0f, 0.0f, 20.0f, -20.0f);
+		rosStep();
+		driverRos.frame(T0 + 50 * MS, S0 + WINDOW_NS, 0.2f, -0.2f, 20.0f, -20.0f);
+		rosStep();
+		nav_msgs::msg::Odometry held;
+		for (int i = 0; i < 4; i++)
+			held = rosStep();
+		EXPECT_GE(held.twist.covariance[0], 1e5);
+		return held;
+	}
+
+	// The resync step moves the pose by its newest reading over one period.
+	void expectOnlyTheNewestReading(const nav_msgs::msg::Odometry& held, int64_t sent) {
+		const nav_msgs::msg::Odometry resync = rosStep();
+		EXPECT_EQ(ns(resync.header.stamp), sent);
+		EXPECT_GT(std::fabs(resync.twist.twist.linear.x), 0.1);
+		EXPECT_NEAR(resync.pose.pose.position.x - held.pose.pose.position.x,
+			resync.twist.twist.linear.x * 1e-9 * WINDOW_NS, 1e-9);
+	}
+};
+
+TEST_F(PlatformDriverROSResync, aResyncAfterALongOutageIntegratesOnlyTheNewestReading) {
+	const nav_msgs::msg::Odometry held = driveThenGoStale();
+	driverRos.frame(T0 + 1000 * MS, S0 + 20 * WINDOW_NS, 3.0f, -3.0f, 4.0f, -4.0f);
+	expectOnlyTheNewestReading(held, T0 + 1000 * MS);
+}
+
+TEST_F(PlatformDriverROSResync, aResyncWhoseCounterGapLooksShortStillIgnoresTheStaleReading) {
+	// The drive's counter moved only one window over the outage, a gap the
+	// held-gap limit alone would accept as measured.
+	const nav_msgs::msg::Odometry held = driveThenGoStale();
+	driverRos.frame(T0 + 300 * MS, S0 + 2 * WINDOW_NS, 3.0f, -3.0f, 4.0f, -4.0f);
+	expectOnlyTheNewestReading(held, T0 + 300 * MS);
 }
 
 TEST_F(PlatformDriverROSOdometry, aSampleWithoutACapturedInstantIsStampedByTheRosClock) {

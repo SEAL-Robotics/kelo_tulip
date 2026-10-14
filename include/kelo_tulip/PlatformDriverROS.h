@@ -45,6 +45,7 @@
 #define KELOTULIP_PLATFORMDRIVERROS_H
 
 #include <memory>
+#include <optional>
 
 #include "kelo_tulip/CommandWatchdog.h"
 #include "kelo_tulip/OdometryFreshness.h"
@@ -114,9 +115,15 @@ protected:
 	void calculateRobotPose(double vx, double vy, double va);
 	// Velocities are zero while the wheel data is stale. windowEndNs is the
 	// host instant of the newest sample every wheel reported (kNoInstantNs
-	// without one).
+	// without one). poseTwist is what the pose integrates over dt: the
+	// published twist, except that a wheel read from its drive's velocities
+	// contributes the mean of its readings at both ends of a measured gap.
 	OdometryFreshnessTracker::Update calculateRobotVelocity2(double& vx, double& vy, double& va, double& displacement,
-		double &dt, bool& everyWheelUsedEncoders, int64_t& windowEndNs);
+		double &dt, bool& everyWheelUsedEncoders, int64_t& windowEndNs, PlanarTwist& poseTwist);
+	// Robot-centre twist from each wheel's pivot velocity in the robot frame.
+	// Takes copies: it works on the residuals.
+	void fuseWheelVelocities(std::vector<double> rx, std::vector<double> ry, double& vx, double& vy,
+		double& va) const;
 	void calculateRobotPose2(double vx, double vy, double va, double dt);
 	void publishOdometry(double vx, double vy, double va, bool wheelDataStale, int64_t stampNs, const OdomPose& pose);
 	void createOdomToBaseLinkTransform(geometry_msgs::msg::TransformStamped& odom_trans, int64_t stampNs,
@@ -173,6 +180,8 @@ protected:
 	std::vector<double> prev_left_enc;
 	std::vector<double> prev_right_enc;
 	std::vector<double> prev_pivot_enc;
+	// Each drive's velocity reading at the last used sample, in the robot frame.
+	std::vector<std::optional<PlanarVelocity>> baselineWheelVelocity;
 	std::unique_ptr<OdometryFreshnessTracker> freshnessTracker;
 	double staleTwistCovariance;
 	double yawCovariance;

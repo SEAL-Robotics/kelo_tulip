@@ -56,6 +56,14 @@ namespace {
 // The ROS read and the last capture are a frame or two apart; a gap beyond
 // this is a drive that restarted its counter.
 constexpr int64_t kMaxSampleGapNs = 100 * 1000 * 1000;
+
+// A wheel's pivot velocity in the robot frame, from its hub speeds (already
+// signed for the wheel's mounting) and pivot rate at pivot angle theta.
+PlanarVelocity pivotVelocity(const WheelConfig& wheel, double wl, double wr, double wp, double theta) {
+	const double cx = 0.5 * (0.5 * wheel.model.diameter) * (wl + wr);
+	const double cy = wp * wheel.model.casteroffset;
+	return PlanarVelocity{(cx * cos(theta)) - (cy * sin(theta)), (cx * sin(theta)) + (cy * cos(theta))};
+}
 }  // namespace
 
 PlatformDriverROS::PlatformDriverROS()
@@ -294,9 +302,10 @@ bool PlatformDriverROS::step() {
 	double vx, vy, va, displacement, dt;
 	bool everyWheelUsedEncoders = false;
 	int64_t windowEndNs = kNoInstantNs;
+	PlanarTwist poseTwist;
 	//calculateRobotVelocity(vx, vy, va, displacement);
 	OdometryFreshnessTracker::Update freshness = calculateRobotVelocity2(vx, vy, va, displacement, dt,
-		everyWheelUsedEncoders, windowEndNs);
+		everyWheelUsedEncoders, windowEndNs, poseTwist);
 	// Without fresh wheel data the velocities are zero and the pose does not
 	// move: reporting the frozen last motion would drift the state estimator.
 	if (freshness.noDataWarning)
@@ -309,14 +318,15 @@ bool PlatformDriverROS::step() {
 	//calculate robot displacement and current pose
 	//calculateRobotPose(vx, vy, va);
 	const OdomPose stepStart{odomx, odomy, odoma};
-	calculateRobotPose2(vx, vy, va, dt);
+	calculateRobotPose2(poseTwist.vx, poseTwist.vy, poseTwist.va, dt);
 
 	// Stamped at the instant the twist describes, from the samples' own
 	// instants rather than when this loop happens to run.
 	const bool held = holdOdometry(freshness.stale, freshness.noNewSample);
 	const OdometryClock::Stamp stamp = odometryClock.next(twistSource(held, everyWheelUsedEncoders), windowEndNs, dt,
 		nh->get_clock()->now().nanoseconds());
-	const OdomPose stampedPose = integratePose(stepStart, vx, vy, va, stamp.poseFraction * dt);
+	const OdomPose stampedPose = integratePose(stepStart, poseTwist.vx, poseTwist.vy, poseTwist.va,
+		stamp.poseFraction * dt);
 	publishOdometry(vx, vy, va, held, stamp.ns, stampedPose);
 
 	// publish_tf defaults false so the driver never competes with a separate
@@ -528,6 +538,7 @@ void PlatformDriverROS::initializeEncoderValue() {
 	prev_left_enc.resize(nWheels, 0);
 	prev_right_enc.resize(nWheels, 0);
 	prev_pivot_enc.resize(nWheels, 0);
+	baselineWheelVelocity.assign(nWheels, std::nullopt);
 
 	for (int i=0; i<nWheels; i++) {
 		std::vector<double> encoderValueInit = driver->getEncoderValue(i);
@@ -617,12 +628,14 @@ void PlatformDriverROS::calculateRobotPose(double vx, double vy, double va) {
 }
 
 OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(double& vx, double& vy, double& va,
-	double& displacement, double &dt, bool& everyWheelUsedEncoders, int64_t& windowEndNs) {
+	double& displacement, double &dt, bool& everyWheelUsedEncoders, int64_t& windowEndNs, PlanarTwist& poseTwist) {
 	dt = LOOP_PERIOD_SEC; // Target delta time. Replaced by real delta from sensor timestamps, when available.
 	std::vector<double> rx;
 	rx.resize(nWheels, 0);
 	std::vector<double> ry;
 	ry.resize(nWheels, 0);
+	std::vector<double> poseRx(nWheels, 0.0);
+	std::vector<double> poseRy(nWheels, 0.0);
 	
 	//initialize the variables
 	vx = 0;
@@ -666,6 +679,7 @@ OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(doub
 	windowEndNs = commonSampleInstantNs(wheelInstantsNs);
 	everyWheelUsedEncoders = true;
 	OdometryFreshnessTracker::Update freshness = freshnessTracker->update(timestamps);
+	const bool held = holdOdometry(freshness.stale, freshness.noNewSample);
 
 	double encoderDt = 0.0;
 	for (int i = 0; i < nWheels; i++) {
@@ -679,7 +693,8 @@ OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(doub
 		// The encoder delta is only trusted over a plausible interval: never
 		// across the gap after stale data (a drive re-init can restart
 		// sensor_ts near zero), and not without a new sample (delta_ts == 0).
-		if(!isEncoderDeltaUsable(delta_ts, freshness.resync, encoderDeltaLimit))
+		const bool usedEncoders = isEncoderDeltaUsable(delta_ts, freshness.resync, encoderDeltaLimit);
+		if(!usedEncoders)
 		{
 			wl = velocity_1;
 			wr = -velocity_2;
@@ -698,34 +713,55 @@ OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(doub
 			// within the sync jitter; the pose needs one dt for the fused velocity.
 			if (delta_ts > encoderDt) encoderDt = delta_ts;
 		}
+		const double sign = wheelConfigs[i].reverseVelocity ? -1.0 : 1.0;
+		wl *= sign;
+		wr *= sign;
+		double theta = norm(encoder_pivot - wheelConfigs[i].a); // encoder_offset can be obtained from the yaml file or smartWheelDriver class
+		displacement = (wl + wr) * delta_ts; // for liveliness check
+
+		const PlanarVelocity measured = pivotVelocity(wheelConfigs[i], wl, wr, wp, theta);
+		const PlanarVelocity reading =
+			pivotVelocity(wheelConfigs[i], sign * velocity_1, -sign * velocity_2, velocity_pivot, theta);
+		rx[i] = measured.x;
+		ry[i] = measured.y;
+		const PlanarVelocity integrated = usedEncoders ? measured : fallbackIntegrationVelocity(
+			baselineWheelVelocity[i], reading, fallbackSpansMeasuredGap(delta_ts, freshness.resync, maxHeldGap));
+		poseRx[i] = integrated.x;
+		poseRy[i] = integrated.y;
+
 		// Held steps keep the old baseline so the next used step's delta covers
 		// the gap the pose skipped.
-		if (!holdOdometry(freshness.stale, freshness.noNewSample)) {
+		if (!held) {
 			prev_left_enc[i] = encoder_1;
 			prev_right_enc[i] = encoder_2;
 			prev_pivot_enc[i] = encoder_pivot;
+			baselineWheelVelocity[i] = reading;
 		}
-		if (wheelConfigs[i].reverseVelocity) {
-			wl *= -1.0;
-			wr *= -1.0;
-		}
-		double theta = norm(encoder_pivot - wheelConfigs[i].a); // encoder_offset can be obtained from the yaml file or smartWheelDriver class
-		double sin_theta = sin(theta);
-		double cos_theta = cos(theta);
-		displacement = (wl + wr) * delta_ts; // for liveliness check
+	}
+	if (encoderDt > 0.0) dt = encoderDt;
 
-		// calculate velocity components in wheel frame
-		double cx = 0.5 * (0.5 * wheelConfigs[i].model.diameter) * (wl + wr);
-		double cy = wp * wheelConfigs[i].model.casteroffset;
+	fuseWheelVelocities(rx, ry, vx, vy, va);
+	fuseWheelVelocities(poseRx, poseRy, poseTwist.vx, poseTwist.vy, poseTwist.va);
 
-		// transform to robot frame at pivot position
-		rx[i] = (cx * cos_theta) - (cy * sin_theta);
-		ry[i] = (cx * sin_theta) + (cy * cos_theta);
-		// sum cartesian velocities
+	if (held) {
+		vx = 0;
+		vy = 0;
+		va = 0;
+		displacement = 0;
+		poseTwist = PlanarTwist();
+	}
+	return freshness;
+}
+
+void PlatformDriverROS::fuseWheelVelocities(std::vector<double> rx, std::vector<double> ry, double& vx, double& vy,
+	double& va) const {
+	vx = 0;
+	vy = 0;
+	va = 0;
+	for (int i = 0; i < nWheels; i++) {
 		vx += rx[i];
 		vy += ry[i];
 	}
-	if (encoderDt > 0.0) dt = encoderDt;
 
 	// calcultate cartesian velocity of robot center from average of all wheel units
 	if (nWheels > 1) {
@@ -763,14 +799,6 @@ OdometryFreshnessTracker::Update PlatformDriverROS::calculateRobotVelocity2(doub
 	}
 	// calculate angular velocity of robot center from average of all wheel units
 	if(d_sum > 0.0) va = v_sum / d_sum;
-
-	if (holdOdometry(freshness.stale, freshness.noNewSample)) {
-		vx = 0;
-		vy = 0;
-		va = 0;
-		displacement = 0;
-	}
-	return freshness;
 }
 
 void PlatformDriverROS::calculateRobotPose2(double vx, double vy, double va, double dt) {
