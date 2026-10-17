@@ -209,6 +209,26 @@ TEST_F(PlatformDriverRecovery, aDriverStartedWithTheEmergencyPairOpenWaitsInstea
 	EXPECT_GT(speed(0), 0.1f) << "a command after a zero one drives";
 }
 
+TEST_F(PlatformDriverRecovery, theStartSequenceReRunsTheMomentThePairClosesWhateverTheRetestPhase) {
+	// INIT also re-runs it every 500 steps; closing at every phase of that
+	// cadence shows the close itself starts it.
+	for (int offset = 0; offset < 500; offset += 50) {
+		// Open before the fresh driver's first frame, which SetUp's update reports.
+		for (int w = 0; w < kWheels; w++)
+			bus.openPair(w);
+		SetUp();
+		driver->setCanChangeActive();
+		ASSERT_TRUE(run(1000 + offset));
+		for (int w = 0; w < kWheels; w++)
+			bus.closePair(w);
+		ASSERT_TRUE(run(40));
+		for (int w = 0; w < kWheels; w++) {
+			EXPECT_TRUE(wheelEnabled(w)) << "offset " << offset << ", wheel " << w;
+			EXPECT_EQ(bus.report(w).status1, 63) << "offset " << offset << ", wheel " << w;
+		}
+	}
+}
+
 TEST_F(PlatformDriverRecovery, waitingForTheEmergencyPairAtStartLogsOnceNotEveryRetest) {
 	kelo::RtLog& log = kelo::RtLog::instance();
 	log.drain();
