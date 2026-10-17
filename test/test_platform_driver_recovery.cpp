@@ -7,6 +7,7 @@
 
 #include "fake_kelo_bus.h"
 #include "kelo_tulip/PlatformDriver.h"
+#include "kelo_tulip/RtLog.h"
 
 namespace {
 
@@ -31,7 +32,7 @@ protected:
 		driver->clockMs += kCycleMs;
 		// A live command source, as the cycle's command watchdog expects.
 		if (commanding)
-			driver->setTargetVelocity(0.3, 0.0, 0.0);
+			driver->setTargetVelocity(commandVx, 0.0, 0.0);
 		const bool keepRunning = driver->step();
 		bus.update();
 		return keepRunning;
@@ -64,6 +65,7 @@ protected:
 	FakeBus bus;
 	std::unique_ptr<ClockedDriver> driver;
 	bool commanding = false;
+	double commandVx = 0.3;
 };
 
 TEST_F(PlatformDriverRecovery, drivesWhenAllWheelsAreHealthy) {
@@ -181,6 +183,142 @@ TEST_F(PlatformDriverRecovery, aBriefNonOperationalStateFromALostFrameDoesNotSlo
 	ASSERT_TRUE(run(20));
 
 	EXPECT_NEAR(speed(0), before, 0.001f);
+}
+
+TEST_F(PlatformDriverRecovery, aDriverStartedWithTheEmergencyPairOpenWaitsInsteadOfGivingUp) {
+	for (int w = 0; w < kWheels; w++)
+		bus.openPair(w);
+	driver->setCanChangeActive();
+	EXPECT_TRUE(run(60000)) << "an E-stop held at start must not stop the driver";
+	commanding = true;
+	ASSERT_TRUE(run(100));
+
+	for (int w = 0; w < kWheels; w++)
+		bus.closePair(w);
+	ASSERT_TRUE(run(100)) << "the start sequence re-runs as soon as the pair closes";
+	for (int w = 0; w < kWheels; w++) {
+		EXPECT_TRUE(wheelEnabled(w)) << "wheel " << w;
+		EXPECT_EQ(bus.report(w).status1, 63) << "wheel " << w;
+	}
+	ASSERT_TRUE(run(300));
+	EXPECT_FLOAT_EQ(speed(0), 0.0f) << "a command already there when the pair closed must not drive";
+	commandVx = 0.0;
+	ASSERT_TRUE(run(20));
+	commandVx = 0.3;
+	ASSERT_TRUE(run(300));
+	EXPECT_GT(speed(0), 0.1f) << "a command after a zero one drives";
+}
+
+TEST_F(PlatformDriverRecovery, waitingForTheEmergencyPairAtStartLogsOnceNotEveryRetest) {
+	kelo::RtLog& log = kelo::RtLog::instance();
+	log.drain();
+	const std::uint64_t droppedBefore = log.dropped();
+	for (int w = 0; w < kWheels; w++)
+		bus.openPair(w);
+	driver->setCanChangeActive();
+
+	std::size_t lines = 0;
+	for (int second = 0; second < 60; second++) {
+		ASSERT_TRUE(run(1000));
+		lines += log.drain();
+	}
+	lines += static_cast<std::size_t>(log.dropped() - droppedBefore);
+	EXPECT_LT(lines, 10u) << "an E-stop held for a minute must not flood the journal";
+}
+
+TEST_F(PlatformDriverRecovery, aDriveThatNeverBecomesReadyAtStartStillStopsTheDriver) {
+	bus.setFault(1, 0x80);
+	driver->setCanChangeActive();
+	EXPECT_FALSE(run(4000));
+}
+
+TEST_F(PlatformDriverRecovery, anEmergencyStopWhileDrivingHoldsTheDriverInsteadOfStoppingIt) {
+	startDriving();
+	for (int w = 0; w < kWheels; w++)
+		bus.openPair(w);
+	EXPECT_TRUE(run(30000)) << "an E-stop must not stop the driver";
+	for (int w = 0; w < kWheels; w++)
+		EXPECT_FLOAT_EQ(speed(w), 0.0f) << "wheel " << w;
+
+	for (int w = 0; w < kWheels; w++)
+		bus.closePair(w);
+	ASSERT_TRUE(run(1500));
+	for (int w = 0; w < kWheels; w++) {
+		EXPECT_TRUE(wheelEnabled(w)) << "wheel " << w;
+		EXPECT_EQ(bus.report(w).status1, 63) << "wheel " << w;
+	}
+	// Released with the command still streaming: the base must not restart by itself.
+	ASSERT_TRUE(run(3000));
+	for (int w = 0; w < kWheels; w++)
+		EXPECT_FLOAT_EQ(speed(w), 0.0f) << "wheel " << w;
+
+	commandVx = 0.0;
+	ASSERT_TRUE(run(20));
+	commandVx = 0.3;
+	ASSERT_TRUE(run(300));
+	EXPECT_GT(speed(0), 0.1f) << "a command after a zero one drives";
+}
+
+TEST_F(PlatformDriverRecovery, aCommandTimeoutAfterTheEmergencyStopCountsAsTheZeroCommand) {
+	startDriving();
+	for (int w = 0; w < kWheels; w++)
+		bus.openPair(w);
+	ASSERT_TRUE(run(1000));
+	commanding = false;
+	ASSERT_TRUE(run(500));
+	for (int w = 0; w < kWheels; w++)
+		bus.closePair(w);
+	ASSERT_TRUE(run(500));
+	commanding = true;
+	ASSERT_TRUE(run(300));
+	EXPECT_GT(speed(0), 0.1f);
+}
+
+TEST_F(PlatformDriverRecovery, aShortPressStillNeedsAZeroCommandBeforeTheBaseDrivesAgain) {
+	startDriving();
+	for (int w = 0; w < kWheels; w++)
+		bus.openPair(w);
+	ASSERT_TRUE(run(50));
+	for (int w = 0; w < kWheels; w++)
+		bus.closePair(w);
+	ASSERT_TRUE(run(3000));
+	for (int w = 0; w < kWheels; w++) {
+		EXPECT_TRUE(wheelEnabled(w)) << "wheel " << w;
+		EXPECT_FLOAT_EQ(speed(w), 0.0f) << "wheel " << w;
+	}
+}
+
+TEST_F(PlatformDriverRecovery, aChatteringEmergencyPairDoesNotFloodTheJournal) {
+	startDriving();
+	kelo::RtLog& log = kelo::RtLog::instance();
+	log.drain();
+	const std::uint64_t droppedBefore = log.dropped();
+
+	std::size_t lines = 0;
+	for (int bounce = 0; bounce < 60; bounce++) {
+		for (int w = 0; w < kWheels; w++)
+			bus.openPair(w);
+		ASSERT_TRUE(run(20));
+		for (int w = 0; w < kWheels; w++)
+			bus.closePair(w);
+		ASSERT_TRUE(run(480));
+		lines += log.drain();
+	}
+	lines += static_cast<std::size_t>(log.dropped() - droppedBefore);
+	EXPECT_LT(lines, 40u) << "60 bounces in 30 s";
+}
+
+TEST_F(PlatformDriverRecovery, oneDriveInSafeTorqueOffRampsEveryWheelToZero) {
+	startDriving();
+	const float before = speed(0);
+	bus.openPair(2);
+	ASSERT_TRUE(run(20));
+	EXPECT_LT(speed(0), before) << "must already be slowing";
+	EXPECT_GT(speed(0), 0.0f) << "a ramp, not an instantaneous zero";
+
+	ASSERT_TRUE(run(10000));
+	for (int w = 0; w < kWheels; w++)
+		EXPECT_FLOAT_EQ(speed(w), 0.0f) << "wheel " << w;
 }
 
 TEST_F(PlatformDriverRecovery, aWheelTheOperatorSwitchedOffIsNotRecoveredWhenItsSlaveDrops) {

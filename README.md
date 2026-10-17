@@ -30,9 +30,14 @@
 >   away: recovery spends no attempt while it is gone, holds every wheel at
 >   zero (ramped) and re-enables it once it looks sane; a drive that stays in
 >   error, or drops out again and again, is still given up;
+> - a drive in safe torque off (its emergency pair open, as an E-stop does)
+>   is waited for, not given up, at start and while driving: no attempt is
+>   spent, every wheel is held at zero (ramped) and the drives are re-enabled
+>   by a disable-enable once the pair closes;
 > - EtherCAT diagnostics: the ESC error counters per slave and a CSV dump of
 >   the last seconds of the 1 kHz loop on a communication error;
-> - INIT re-runs the drive start sequence up to 3 times before giving up;
+> - INIT re-runs the drive start sequence up to 3 times before giving up, and
+>   for as long as a drive is in safe torque off;
 > - `platform_driver` exits (non-zero) once its EtherCAT loop has stopped, so a
 >   process supervisor can restart it instead of it idling with dead drives.
 >

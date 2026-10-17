@@ -69,6 +69,7 @@ namespace {
 // not keep driving on the rest. The ramp keeps a stop from being an instantaneous
 // zero; the drive's current limit bounds the braking torque either way.
 constexpr float kHoldSetpointStep = 0.05f;
+constexpr double kSafeTorqueOffLogQuietMs = 10000.0;
 // A frame is read about one cycle after it is sent, and a stalled cycle still
 // reads the frame it sent: a gap this long is a step of the clock, not a
 // frame in flight.
@@ -133,6 +134,12 @@ PlatformDriver::PlatformDriver(const std::vector<WheelConfig>& wheelConfigs, con
 	initResets = 0;
 	maxInitResets = 3;
 	initTimeoutSteps = 500;
+	initSafeTorqueOff = false;
+	stoRearmPending = false;
+	stoRearmLogged = false;
+	lastRearmLogMs = -kSafeTorqueOffLogQuietMs;
+	lastStoLogMs.assign(nWheels, -kSafeTorqueOffLogQuietMs);
+	stoEntryLogged.assign(nWheels, false);
 
 	clockStart = RecoveryClock::now();
 	lastRealMs = nowMs();
@@ -238,18 +245,31 @@ bool PlatformDriver::stepInit() {
 		resetErrorFlags();
 	}
 
+	const unsigned int inSafeTorqueOff = wheelsInSafeTorqueOff();
+	const bool safeTorqueOff = inSafeTorqueOff > 0;
+	if (safeTorqueOff != initSafeTorqueOff) {
+		initSafeTorqueOff = safeTorqueOff;
+		if (safeTorqueOff) {
+			stoRearmPending = true;
+			RtLog::instance().pushf("%u of %d drives in safe torque off (emergency pair open): waiting for it to close.",
+				inSafeTorqueOff, nWheels);
+		} else {
+			// The drives clear their latched errors only on a disable followed by an enable.
+			RtLog::instance().push("Emergency pair closed: running the start sequence.");
+			restartInitSequence();
+		}
+	}
+
 	switch (initTimeoutAction(ready, static_cast<unsigned int>(stepCount - initAttemptStartStep),
-		initTimeoutSteps, initResets, maxInitResets)) {
+		initTimeoutSteps, initResets, maxInitResets, safeTorqueOff)) {
 		case InitAction::ResetWheels:
 			initResets++;
 			RtLog::instance().pushf("Wheels not ready after %u steps, re-running the start sequence (%u/%u).",
 				initTimeoutSteps, initResets, maxInitResets);
-			// doStop sends disable again until initCounter passes initTolerance, then enable.
-			initCounter = 0;
-			initAttemptStartStep = stepCount;
-			// As on a fresh start, so hasWheelStatusError's calibration allowance applies again.
-			for (int wheel = 0; wheel < nWheels; wheel++)
-				abs_sum_encoder[wheel].assign(2, 0.0);
+			restartInitSequence();
+			break;
+		case InitAction::RetestSafeTorqueOff:
+			restartInitSequence();
 			break;
 		case InitAction::GiveUp:
 			RtLog::instance().push("Stopping platform driver, because wheels don't become ready.");
@@ -259,6 +279,51 @@ bool PlatformDriver::stepInit() {
 	}
 
 	return true;
+}
+
+void PlatformDriver::restartInitSequence() {
+	// doStop sends disable again until initCounter passes initTolerance, then enable.
+	initCounter = 0;
+	initAttemptStartStep = stepCount;
+	// As on a fresh start, so hasWheelStatusError's calibration allowance applies again.
+	for (int wheel = 0; wheel < nWheels; wheel++)
+		abs_sum_encoder[wheel].assign(2, 0.0);
+}
+
+unsigned int PlatformDriver::wheelsInSafeTorqueOff() const {
+	unsigned int count = 0;
+	for (int i = 0; i < nWheels; i++)
+		if (wheelInSafeTorqueOff(processData[i].status1))
+			count++;
+	return count;
+}
+
+// After safe torque off the drives come back with whatever command is still
+// streaming. Releasing an E-stop must not restart the base, so every wheel
+// stays at zero until the command has read zero (or lapsed) once the drives
+// are back: the source has to stop before it can drive again. The platform
+// ramp has followed the command meanwhile, so it must have run down to zero
+// too, or the wheels would replay its tail.
+void PlatformDriver::updateSafeTorqueOffRearm(bool holding, bool targetsZero) {
+	if (!stoRearmPending || holding)
+		return;
+	const VelocityCommand& c = cycleCommand.command;
+	const bool commandZero = commandStale || cycleCommand.seq == 0 || (c.vx == 0.0 && c.vy == 0.0 && c.va == 0.0);
+	const bool zero = commandZero && targetsZero;
+	const bool mayLog = recoveryClockMs - lastRearmLogMs >= kSafeTorqueOffLogQuietMs;
+	if (!zero) {
+		if (!stoRearmLogged && mayLog) {
+			RtLog::instance().push("Drives back from safe torque off: holding every wheel at zero until the velocity "
+				"command is zero.");
+			lastRearmLogMs = recoveryClockMs;
+			stoRearmLogged = true;
+		}
+		return;
+	}
+	if (stoRearmLogged)
+		RtLog::instance().push("Velocity command is zero: the wheels follow it again.");
+	stoRearmPending = false;
+	stoRearmLogged = false;
 }
 
 bool PlatformDriver::stepReady() {
@@ -523,11 +588,16 @@ bool PlatformDriver::hasWheelStatusError(unsigned int wheel) {
 }
 
 void PlatformDriver::updateStatusError() {
+	// Every start-sequence re-run clears the flag; waiting out an emergency
+	// pair re-runs it for as long as the pair stays open, and INIT says so once.
+	const bool quiet = state == DRIVER_STATE_INIT && initSafeTorqueOff;
 	for (int i = 0; i < nWheels; i++) {
 		if (hasWheelStatusError(i)) {
 			int s1 = processData[i].status1;
-			int s2 = processData[i].status2;		
-			if (!statusError) {
+			int s2 = processData[i].status2;
+			if (!statusError && quiet) {
+				statusError = true;
+			} else if (!statusError) {
 				RtLog::instance().pushf("Status error: wheel=%d, status1=%d, status2=%d", i, s1, s2);
 				statusError = true;
 			}
@@ -732,7 +802,7 @@ void PlatformDriver::doControl() {
 	// meanwhile for a lost slave (its inputs are zeroed, so its timestamp is
 	// stale); that is accepted. On give-up stepActive ends the loop before the
 	// ramp completes, which the drive's current limit and the restart cover.
-	const bool hold = anyWheelHolding();
+	const bool holding = anyWheelHolding();
 
 	for (int i = 0; i < nWheels; i++) {
 		txpdo1_t* wheel_data = getWheelProcessData(i);
@@ -758,6 +828,8 @@ void PlatformDriver::doControl() {
 		wheelSetpoints[2 * i + 1] = Utils::clip(setpoint2, wheelsetpointmax, -wheelsetpointmax);
 	}
 
+	updateSafeTorqueOffRearm(holding, velocityPlatformController.isRampedVelocityZero() && wheelSetpointsZero());
+	const bool hold = holding || stoRearmPending;
 	/* ramp all wheels to zero together while any wheel is recovering, never cut */
 	setpointSlew.step(wheelSetpoints.data(), hold, kHoldSetpointStep, releaseStep, wheelSetpoints.data());
 
@@ -849,11 +921,14 @@ void PlatformDriver::doWheelRecovery(unsigned int wheel) {
 	const txpdo1_t& data = processData[wheel];
 	const WheelRecoveryMachine::Input input{recoveryClockMs, operatorWants,
 		wheelNeedsRecovery(data.status1, data.status2, operatorWants), wheelLinkUp(wheel),
-		wheelStatusSane(data.status1, data.status2)};
+		wheelStatusSane(data.status1, data.status2), wheelInSafeTorqueOff(data.status1),
+		wheelFrameValid(data.status1)};
 
 	const WheelRecoveryMachine::Output out = recoveryMachines[wheel].step(input);
 	recoveryAllowsEnable[wheel] = out.allowsEnable;
 	wheelHolding[wheel] = out.holdAtZero;
+	if (out.events & RECOVERY_EVENT_SAFE_TORQUE_OFF)
+		stoRearmPending = true;
 	logRecoveryEvents(wheel, out.events);
 	applyWheelEnable(wheel);
 }
@@ -885,6 +960,17 @@ void PlatformDriver::logRecoveryEvents(unsigned int wheel, unsigned int events) 
 		log.pushf("Wheel %u recovery attempts are reset to 0.", w);
 	if (has(RECOVERY_EVENT_LINK_LOSS_TIMEOUT))
 		log.pushf("Wheel %u (slave %d) did not answer within %.0f ms", w, slave, recoveryConfig.linkLossWindowMs);
+	// A chattering pair would log every bounce: one entry per wheel per quiet window.
+	if (has(RECOVERY_EVENT_SAFE_TORQUE_OFF)) {
+		stoEntryLogged[wheel] = recoveryClockMs - lastStoLogMs[wheel] >= kSafeTorqueOffLogQuietMs;
+		if (stoEntryLogged[wheel]) {
+			lastStoLogMs[wheel] = recoveryClockMs;
+			log.pushf("Wheel %u is in safe torque off (emergency pair open, status1=%u, status2=%u): holding all "
+				"wheels until it closes", w, data.status1, data.status2);
+		}
+	}
+	if (has(RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED) && stoEntryLogged[wheel])
+		log.pushf("Wheel %u is out of safe torque off and enabled again", w);
 	if (has(RECOVERY_EVENT_GAVE_UP))
 		log.pushf("Wheel %u could not be recovered. Stopping operation (status1=%u, status2=%u)", w, data.status1,
 			data.status2);

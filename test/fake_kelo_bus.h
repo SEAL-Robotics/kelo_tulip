@@ -55,6 +55,11 @@ public:
 		stuck_[wheel] = comesBackStuck;
 		sawDisable_[wheel] = false;
 	}
+	// The E-stop opens the emergency pair: the drive goes to safe torque off.
+	// Closed again, it keeps EXT_DISABLE_ERR and the OSSD errors latched until
+	// it has been disabled and then enabled.
+	void openPair(int wheel) { pairOpen_[wheel] = true; }
+	void closePair(int wheel) { pairOpen_[wheel] = false; }
 	void setState(int wheel, int state) { slaves_[wheel + 1].state = static_cast<uint16>(state); }
 	void setFault(int wheel, uint16_t extraBits) { faultBits_[wheel] = extraBits; }
 	// A hub turning faster than commanded (pushed, or still braking).
@@ -71,28 +76,52 @@ public:
 				sawDisable_[w] = true;
 			if (stuck_[w] && enabled && sawDisable_[w])
 				stuck_[w] = false;
+			updatePair(w, enabled);
 			txpdo1_t& in = inputs_[w + 1];
 			in.status2 = 2051;
-			if (stuck_[w])
+			if (pairOpen_[w]) {
+				in.status1 = 5177;
+				in.status2 = 51203;
+			} else if (pairLatched_[w]) {
+				in.status1 = 1085;
+				in.status2 = 51203;
+			} else if (stuck_[w]) {
 				in.status1 = 61;
-			else
+			} else {
 				in.status1 = static_cast<uint16_t>((enabled ? 63 : 60) | faultBits_[w]);
+			}
 			in.voltage_bus = 51.5f;
-			// The hubs follow an enabled drive's setpoint; a disabled one
-			// reports what it was told to coast at.
+			// The hubs follow a drive with torque; one without reports what it
+			// was told to coast at.
+			const bool torque = enabled && !pairOpen_[w] && !pairLatched_[w];
 			const rxpdo1_t& out = outputs_[w + 1];
-			in.velocity_1 = enabled ? out.setpoint1 + extraSpeed_[w] : coastSpeed_[w];
-			in.velocity_2 = enabled ? out.setpoint2 + extraSpeed_[w] : coastSpeed_[w];
+			in.velocity_1 = torque ? out.setpoint1 + extraSpeed_[w] : coastSpeed_[w];
+			in.velocity_2 = torque ? out.setpoint2 + extraSpeed_[w] : coastSpeed_[w];
 		}
 	}
 
 private:
+	void updatePair(int w, bool enabled) {
+		if (pairOpen_[w]) {
+			pairLatched_[w] = true;
+			pairDisabledSinceClose_[w] = false;
+		} else if (pairLatched_[w]) {
+			if (!enabled)
+				pairDisabledSinceClose_[w] = true;
+			else if (pairDisabledSinceClose_[w])
+				pairLatched_[w] = false;
+		}
+	}
+
 	ec_slavet slaves_[kWheels + 1];
 	txpdo1_t inputs_[kWheels + 1];
 	rxpdo1_t outputs_[kWheels + 1];
 	bool lost_[kWheels] = {};
 	bool stuck_[kWheels] = {};
 	bool sawDisable_[kWheels] = {};
+	bool pairOpen_[kWheels] = {};
+	bool pairLatched_[kWheels] = {};
+	bool pairDisabledSinceClose_[kWheels] = {};
 	uint16_t faultBits_[kWheels] = {};
 	float extraSpeed_[kWheels] = {};
 	float coastSpeed_[kWheels] = {};

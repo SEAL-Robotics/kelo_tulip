@@ -202,6 +202,9 @@ protected:
 	void captureSampleInstants();
 	void advanceRecoveryClock();
 	bool anyWheelFailed() const;
+	unsigned int wheelsInSafeTorqueOff() const;
+	void restartInitSequence();
+	void updateSafeTorqueOffRearm(bool holding, bool targetsZero);
 	void applyWheelEnable(unsigned int wheel);
 
 	bool hasWheelStatusEnabled(unsigned int wheel);
@@ -260,11 +263,19 @@ protected:
 	int initTolerance;
 	int initCounter;
 
-	// INIT: bounded re-runs of the disable-then-enable start sequence.
+	// INIT: bounded re-runs of the disable-then-enable start sequence, unbounded
+	// while a drive is in safe torque off.
 	int initAttemptStartStep;
 	unsigned int initResets;
 	unsigned int maxInitResets;
 	unsigned int initTimeoutSteps;
+	bool initSafeTorqueOff;
+	// Set by safe torque off; cleared once the drives are back and the command reads zero.
+	bool stoRearmPending;
+	bool stoRearmLogged;
+	double lastRearmLogMs;
+	std::vector<double> lastStoLogMs;
+	std::vector<bool> stoEntryLogged;
 
 	// Recovery, one state machine per wheel. The clock is monotonic: chrony
 	// steps the wall clock on this host.

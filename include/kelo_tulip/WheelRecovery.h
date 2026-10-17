@@ -34,16 +34,22 @@ inline bool effectiveWheelEnable(bool operatorEnable, bool recoveryAllows) {
 enum class InitAction {
 	Wait,
 	ResetWheels,
-	GiveUp
+	GiveUp,
+	// Re-run the start sequence without counting it: a drive is in safe torque off.
+	RetestSafeTorqueOff
 };
 
 // What INIT does when the wheels are not ready: keep waiting within the
 // timeout, then re-run the disable-then-enable start sequence a bounded number
 // of times before giving up (which stops EtherCAT and restarts the stack).
+// A drive in safe torque off is waiting for its emergency pair, not faulty:
+// the sequence is re-run for as long as that lasts and never given up.
 inline InitAction initTimeoutAction(bool ready, unsigned int stepsInAttempt, unsigned int timeoutSteps,
-	unsigned int resetsDone, unsigned int maxResets) {
+	unsigned int resetsDone, unsigned int maxResets, bool safeTorqueOff = false) {
 	if (ready || stepsInAttempt <= timeoutSteps)
 		return InitAction::Wait;
+	if (safeTorqueOff)
+		return InitAction::RetestSafeTorqueOff;
 	return resetsDone < maxResets ? InitAction::ResetWheels : InitAction::GiveUp;
 }
 
@@ -55,7 +61,9 @@ enum WheelState {
 	WHEEL_STATUS_RECOVERY_SENDING_ENABLE  = 4,
 	WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION = 5,
 	// The slave is not answering: the wheel is held disabled, no attempt is spent.
-	WHEEL_LINK_LOST = 6
+	WHEEL_LINK_LOST = 6,
+	// The emergency pair is open: held disabled for as long as it lasts, no attempt is spent.
+	WHEEL_SAFE_TORQUE_OFF = 7
 };
 
 // Status bits per KELO's "KELO Drive KD165 Ethercat Communication" (firmware
@@ -68,6 +76,22 @@ constexpr std::uint16_t kStatus2ErrorMask = 0xF7FC;
 // latched (status1 4157), and the disable-enable that re-tests the wheel
 // clears it, so it must not hold the wheel off.
 constexpr std::uint16_t kStatus1EcatWatchdog = 0x1000;
+constexpr std::uint16_t kStatus1OssdOk = 0x0004;
+// B4 and B5 read 1 in every frame a drive sends; a zeroed process image has neither.
+constexpr std::uint16_t kStatus1AlwaysSet = 0x0030;
+
+// A frame the drive sent, as opposed to the zeroed image of a lost slave.
+inline bool wheelFrameValid(std::uint16_t status1) {
+	return (status1 & kStatus1AlwaysSet) == kStatus1AlwaysSet;
+}
+
+// The drive reports its emergency pair open: safe torque off. OSSD_OK is taken
+// to follow the pair, as the values seen suggest; EXT_DISABLE_ERR and the OSSD
+// errors in STATUS2 stay latched after it closes, until the drive is disabled
+// and enabled again.
+inline bool wheelInSafeTorqueOff(std::uint16_t status1) {
+	return wheelFrameValid(status1) && (status1 & kStatus1OssdOk) == 0;
+}
 
 // A drive that may be re-enabled after its slave returns: OSSD and power stage
 // OK and no error latched in either word apart from the EtherCAT watchdog. An
@@ -113,8 +137,12 @@ struct WheelRecoveryConfig {
 	double counterResetMs = 30000.0;
 	// How long a slave may stay unreachable before the wheel is given up.
 	double linkLossWindowMs = 5000.0;
-	// A returned slave must look sane this long before it is re-enabled.
+	// A returned slave must look sane this long before it is re-enabled, and a
+	// closed emergency pair must read closed this long.
 	double linkStableMs = 100.0;
+	// While a drive reads safe torque off it is re-tested this often: should
+	// OSSD_OK be latched like the errors, only a re-enable shows the pair closed.
+	double safeTorqueOffRetestMs = 1000.0;
 };
 
 enum RecoveryEvent : unsigned int {
@@ -126,7 +154,9 @@ enum RecoveryEvent : unsigned int {
 	RECOVERY_EVENT_ATTEMPTS_RESET = 1u << 5,
 	RECOVERY_EVENT_GAVE_UP = 1u << 6,
 	RECOVERY_EVENT_LINK_LOSS_TIMEOUT = 1u << 7,
-	RECOVERY_EVENT_ABORTED_BY_OPERATOR = 1u << 8
+	RECOVERY_EVENT_ABORTED_BY_OPERATOR = 1u << 8,
+	RECOVERY_EVENT_SAFE_TORQUE_OFF = 1u << 9,
+	RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED = 1u << 10
 };
 
 // One wheel's recovery, with time passed in so it can be tested. A fault on a
@@ -134,7 +164,10 @@ enum RecoveryEvent : unsigned int {
 // after them. An unreachable slave spends none, because the retries would run
 // out before it can answer: it is held disabled for linkLossWindowMs, then
 // re-enabled once it looks sane, and that re-enable is one counted attempt, so
-// repeated dropouts still add up to a give-up.
+// repeated dropouts still add up to a give-up. A drive in safe torque off
+// spends none and is never given up: an E-stop is not a wheel fault. It is
+// held disabled until its pair reads closed, then re-enabled by an uncounted
+// disable-enable; a fault that outlasts it falls to the counted recovery.
 class WheelRecoveryMachine {
 public:
 	struct Input {
@@ -143,6 +176,8 @@ public:
 		bool needsRecovery;
 		bool linkUp;
 		bool statusSane;
+		bool safeTorqueOff = false;
+		bool frameValid = true;
 	};
 	struct Output {
 		bool allowsEnable;
@@ -168,6 +203,12 @@ public:
 			linkUpSinceMs_ = kNever;
 			events |= RECOVERY_EVENT_LINK_LOST;
 		}
+		// A retest runs to its end; it sees the pair still open there.
+		if (in.operatorEnable && in.linkUp && in.safeTorqueOff && !retesting_ &&
+			state_ != WHEEL_FAILURE && state_ != WHEEL_SAFE_TORQUE_OFF) {
+			enterSafeTorqueOff(now);
+			events |= RECOVERY_EVENT_SAFE_TORQUE_OFF;
+		}
 
 		switch (state_) {
 			case WHEEL_NORMAL_OPERATION:
@@ -177,6 +218,9 @@ public:
 				break;
 			case WHEEL_LINK_LOST:
 				stepLinkLost(in, events);
+				break;
+			case WHEEL_SAFE_TORQUE_OFF:
+				stepSafeTorqueOff(in);
 				break;
 			case WHEEL_STATUS_RECOVERY_SENDING_DISABLE:
 				if (now - entryMs_ > config_.disableMs)
@@ -194,7 +238,7 @@ public:
 		// The enable goes out on the first cycle of ENABLE, so a fresh
 		// transition into it already allows it.
 		const bool withheld = state_ == WHEEL_FAILURE || state_ == WHEEL_LINK_LOST ||
-			state_ == WHEEL_STATUS_RECOVERY_SENDING_DISABLE;
+			state_ == WHEEL_SAFE_TORQUE_OFF || state_ == WHEEL_STATUS_RECOVERY_SENDING_DISABLE;
 		return Output{!withheld, state_ != WHEEL_NORMAL_OPERATION, events};
 	}
 
@@ -209,12 +253,41 @@ private:
 		return state_ == WHEEL_STATUS_RECOVERY_SENDING_DISABLE ||
 			state_ == WHEEL_STATUS_RECOVERY_SENDING_ENABLE ||
 			state_ == WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION ||
-			state_ == WHEEL_LINK_LOST;
+			state_ == WHEEL_LINK_LOST || state_ == WHEEL_SAFE_TORQUE_OFF;
 	}
 
 	void enter(WheelState state, double now) {
 		state_ = state;
 		entryMs_ = now;
+		const bool inSequence = state == WHEEL_STATUS_RECOVERY_SENDING_DISABLE ||
+			state == WHEEL_STATUS_RECOVERY_SENDING_ENABLE ||
+			state == WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION;
+		if (!inSequence)
+			retesting_ = false;
+	}
+
+	void enterSafeTorqueOff(double now) {
+		enter(WHEEL_SAFE_TORQUE_OFF, now);
+		pairClosedSinceMs_ = kNever;
+	}
+
+	// The uncounted disable-enable of a drive in safe torque off.
+	void beginRetest(double now, bool pairReadOpen) {
+		enter(WHEEL_STATUS_RECOVERY_SENDING_DISABLE, now);
+		retesting_ = true;
+		retestStartedOpen_ = pairReadOpen;
+	}
+
+	// A zeroed image says nothing about the pair, so it never reads closed.
+	void stepSafeTorqueOff(const Input& in) {
+		const double now = in.nowMs;
+		if (in.safeTorqueOff || !in.frameValid)
+			pairClosedSinceMs_ = kNever;
+		else if (pairClosedSinceMs_ == kNever)
+			pairClosedSinceMs_ = now;
+		const bool closed = pairClosedSinceMs_ != kNever && now - pairClosedSinceMs_ >= config_.linkStableMs;
+		if (closed || now - entryMs_ >= config_.safeTorqueOffRetestMs)
+			beginRetest(now, !closed);
 	}
 
 	// One counted try: disable, enable, wait; past maxAttempts the wheel is given up.
@@ -278,12 +351,28 @@ private:
 	}
 
 	void stepWaiting(const Input& in, unsigned int& events) {
+		const double now = in.nowMs;
 		if (!in.needsRecovery) {
-			events |= RECOVERY_EVENT_SUCCEEDED;
-			enter(WHEEL_NORMAL_OPERATION, in.nowMs);
-		} else if (in.nowMs - entryMs_ > config_.retryMs) {
-			events |= RECOVERY_EVENT_ATTEMPT_FAILED;
-			enter(WHEEL_NORMAL_OPERATION, in.nowMs);
+			if (retesting_) {
+				events |= RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED;
+				lastNormalMs_ = now;
+			} else {
+				events |= RECOVERY_EVENT_SUCCEEDED;
+			}
+			enter(WHEEL_NORMAL_OPERATION, now);
+		} else if (now - entryMs_ > config_.retryMs) {
+			if (!retesting_) {
+				events |= RECOVERY_EVENT_ATTEMPT_FAILED;
+				enter(WHEEL_NORMAL_OPERATION, now);
+			} else if (in.safeTorqueOff || !in.frameValid) {
+				enterSafeTorqueOff(now);
+			} else if (retestStartedOpen_) {
+				// The pair closed during this retest, after its disable: one more.
+				beginRetest(now, false);
+			} else {
+				// Closed, yet still faulty: a fault of its own, for the counted recovery.
+				enter(WHEEL_NORMAL_OPERATION, now);
+			}
 		}
 	}
 
@@ -295,6 +384,9 @@ private:
 	double lastAttemptMs_;
 	double lossStartMs_ = 0.0;
 	double linkUpSinceMs_ = kNever;
+	double pairClosedSinceMs_ = kNever;
+	bool retesting_ = false;
+	bool retestStartedOpen_ = false;
 };
 
 

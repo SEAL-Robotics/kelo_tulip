@@ -52,4 +52,11 @@ TEST(InitTimeoutAction, givesUpOnceTheResetsAreSpent) {
 	EXPECT_EQ(initTimeoutAction(false, 501, 500, 0, 0), InitAction::GiveUp);
 }
 
+TEST(InitTimeoutAction, retestsWithoutGivingUpWhileADriveIsInSafeTorqueOff) {
+	EXPECT_EQ(initTimeoutAction(false, 501, 500, 3, 3, true), InitAction::RetestSafeTorqueOff);
+	EXPECT_EQ(initTimeoutAction(false, 501, 500, 0, 0, true), InitAction::RetestSafeTorqueOff);
+	EXPECT_EQ(initTimeoutAction(false, 500, 500, 3, 3, true), InitAction::Wait);
+	EXPECT_EQ(initTimeoutAction(true, 10000, 500, 3, 3, true), InitAction::Wait);
+}
+
 }  // namespace

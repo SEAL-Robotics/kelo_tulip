@@ -20,17 +20,233 @@ struct Scenario {
 
 	// Advance to `untilMs` in 1 ms cycles with a fixed input.
 	WheelRecoveryMachine::Output run(double untilMs, bool linkUp, bool needsRecovery, bool sane = true,
-		bool operatorEnable = true) {
+		bool operatorEnable = true, bool safeTorqueOff = false, bool frameValid = true) {
 		WheelRecoveryMachine::Output out{true, false, 0};
 		while (nowMs < untilMs) {
 			nowMs += 1.0;
-			out = machine.step({nowMs, operatorEnable, needsRecovery, linkUp, sane});
+			out = machine.step({nowMs, operatorEnable, needsRecovery, linkUp, sane, safeTorqueOff, frameValid});
 			events |= out.events;
 		}
 		return out;
 	}
 	bool saw(kelo::RecoveryEvent e) const { return (events & e) != 0; }
 };
+
+// A drive on an emergency pair. Open, it is in safe torque off. Closed, it
+// keeps its errors latched until it has been disabled and then enabled again;
+// with ossdOkLatched it keeps OSSD_OK clear until then too.
+struct PairDrive {
+	bool open = false;
+	bool ossdOkLatched = false;
+	bool latched = false;
+	bool disabledSinceClose = false;
+
+	bool safeTorqueOff() const { return open || (latched && ossdOkLatched); }
+	bool needsRecovery() const { return open || latched; }
+	void command(bool enabled) {
+		if (open) {
+			latched = true;
+			disabledSinceClose = false;
+		} else if (!enabled) {
+			disabledSinceClose = true;
+		} else if (disabledSinceClose) {
+			latched = false;
+		}
+	}
+};
+
+struct PairScenario {
+	WheelRecoveryMachine machine{WheelRecoveryConfig(), 0.0};
+	PairDrive drive;
+	double nowMs = 0.0;
+	unsigned int events = 0;
+
+	WheelRecoveryMachine::Output run(double untilMs, bool operatorEnable = true) {
+		WheelRecoveryMachine::Output out{true, false, 0};
+		while (nowMs < untilMs) {
+			nowMs += 1.0;
+			const bool faulty = drive.needsRecovery();
+			out = machine.step({nowMs, operatorEnable, faulty, true, !faulty, drive.safeTorqueOff(), true});
+			events |= out.events;
+			drive.command(operatorEnable && out.allowsEnable);
+		}
+		return out;
+	}
+	bool saw(kelo::RecoveryEvent e) const { return (events & e) != 0; }
+};
+
+TEST(WheelInSafeTorqueOff, readsAnOpenEmergencyPairFromAClearedOssdOk) {
+	// 5177: MOTOR_STOP, OSSD_OK clear, EXT_DISABLE_ERR, ECAT_WDOG_ERR, as all
+	// four drives reported with the E-stop pressed.
+	EXPECT_TRUE(kelo::wheelInSafeTorqueOff(5177));
+	EXPECT_TRUE(kelo::wheelInSafeTorqueOff(63 & ~0x0004));
+}
+
+TEST(WheelInSafeTorqueOff, aClosedPairWithItsErrorsStillLatchedIsNotOpen) {
+	// 1085: OSSD_OK set, EXT_DISABLE_ERR latched until a disable-enable.
+	EXPECT_FALSE(kelo::wheelInSafeTorqueOff(1085));
+	EXPECT_FALSE(kelo::wheelInSafeTorqueOff(63));
+	EXPECT_FALSE(kelo::wheelInSafeTorqueOff(61));
+	EXPECT_FALSE(kelo::wheelInSafeTorqueOff(125));
+}
+
+TEST(WheelInSafeTorqueOff, aZeroedProcessImageSaysNothing) {
+	// A lost slave's inputs are zeroed: B4 and B5, set in every real frame, are clear.
+	EXPECT_FALSE(kelo::wheelInSafeTorqueOff(0));
+}
+
+TEST(WheelRecoveryMachine, anOpenEmergencyPairHoldsTheWheelWithoutSpendingAttempts) {
+	PairScenario s;
+	s.run(100);
+	s.drive.open = true;
+	auto out = s.run(150);
+	EXPECT_EQ(s.machine.state(), kelo::WHEEL_SAFE_TORQUE_OFF);
+	EXPECT_FALSE(out.allowsEnable);
+	EXPECT_TRUE(out.holdAtZero);
+	EXPECT_TRUE(s.saw(kelo::RECOVERY_EVENT_SAFE_TORQUE_OFF));
+
+	out = s.run(60000);
+	EXPECT_FALSE(s.machine.failed());
+	EXPECT_EQ(s.machine.attempts(), 0u);
+	EXPECT_TRUE(out.holdAtZero);
+	EXPECT_FALSE(s.saw(kelo::RECOVERY_EVENT_GAVE_UP));
+}
+
+TEST(WheelRecoveryMachine, aPairThatClosesDuringARetestIsRetestedOnceMoreWithoutAnAttempt) {
+	PairScenario s;
+	s.run(100);
+	s.drive.open = true;
+	// The first retest starts a second after the pair opened; close inside it.
+	while (s.machine.state() != kelo::WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION)
+		s.run(s.nowMs + 1);
+	s.drive.open = false;
+	s.run(s.nowMs + 500);
+	EXPECT_FALSE(s.drive.latched);
+	EXPECT_EQ(s.machine.state(), kelo::WHEEL_NORMAL_OPERATION);
+	EXPECT_EQ(s.machine.attempts(), 0u);
+}
+
+TEST(WheelRecoveryMachine, aClosedPairThatLeavesAnotherFaultFallsBackToCountedRecovery) {
+	Scenario s;
+	s.run(100, true, false);
+	s.run(2000, true, true, false, true, true);
+	// Pair closed, but the drive keeps an error a disable-enable does not clear.
+	s.run(6000, true, true, false);
+	EXPECT_TRUE(s.machine.failed());
+	EXPECT_TRUE(s.saw(kelo::RECOVERY_EVENT_GAVE_UP));
+}
+
+TEST(WheelRecoveryMachine, aClosedPairIsReenabledWithoutSpendingAnAttempt) {
+	PairScenario s;
+	s.run(100);
+	s.drive.open = true;
+	s.run(2000);
+	s.drive.open = false;
+	const auto out = s.run(2500);
+	EXPECT_FALSE(s.drive.latched) << "the drive needs a disable, then an enable";
+	EXPECT_EQ(s.machine.state(), kelo::WHEEL_NORMAL_OPERATION);
+	EXPECT_TRUE(out.allowsEnable);
+	EXPECT_FALSE(out.holdAtZero);
+	EXPECT_EQ(s.machine.attempts(), 0u);
+	EXPECT_TRUE(s.saw(kelo::RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED));
+}
+
+TEST(WheelRecoveryMachine, aClosedPairIsRetestedEvenWhenOssdOkStaysClearUntilTheReenable) {
+	PairScenario s;
+	s.drive.ossdOkLatched = true;
+	s.run(100);
+	s.drive.open = true;
+	s.run(3000);
+	s.drive.open = false;
+	s.run(6000);
+	EXPECT_FALSE(s.drive.latched);
+	EXPECT_EQ(s.machine.state(), kelo::WHEEL_NORMAL_OPERATION);
+	EXPECT_EQ(s.machine.attempts(), 0u);
+}
+
+TEST(WheelRecoveryMachine, repeatedEmergencyStopsNeverAddUpToAGiveUp) {
+	PairScenario s;
+	double t = 100;
+	s.run(t);
+	for (int press = 0; press < 20; press++) {
+		s.drive.open = true;
+		s.run(t += 1000);
+		s.drive.open = false;
+		s.run(t += 1000);
+	}
+	EXPECT_FALSE(s.machine.failed());
+	EXPECT_EQ(s.machine.state(), kelo::WHEEL_NORMAL_OPERATION);
+	EXPECT_EQ(s.machine.attempts(), 0u);
+}
+
+TEST(WheelRecoveryMachine, anOperatorDisableEndsSafeTorqueOff) {
+	PairScenario s;
+	s.drive.open = true;
+	s.run(500);
+	ASSERT_EQ(s.machine.state(), kelo::WHEEL_SAFE_TORQUE_OFF);
+	const auto out = s.run(1500, false);
+	EXPECT_EQ(s.machine.state(), kelo::WHEEL_NORMAL_OPERATION);
+	EXPECT_TRUE(s.saw(kelo::RECOVERY_EVENT_ABORTED_BY_OPERATOR));
+	EXPECT_FALSE(out.holdAtZero);
+}
+
+TEST(WheelRecoveryMachine, aSlaveThatReturnsInSafeTorqueOffIsHeldInsteadOfGivenUp) {
+	Scenario s;
+	s.run(100, true, false);
+	s.run(1100, false, true, false);
+	const auto out = s.run(12000, true, true, false, true, true);
+	EXPECT_TRUE(s.saw(kelo::RECOVERY_EVENT_SAFE_TORQUE_OFF));
+	EXPECT_FALSE(s.machine.failed());
+	EXPECT_TRUE(out.holdAtZero);
+}
+
+TEST(WheelRecoveryMachine, aZeroedImageDuringSafeTorqueOffIsNotAClosedPair) {
+	Scenario s;
+	s.run(100, true, false);
+	s.run(1000, true, true, false, true, true);
+	// The slave's image is zeroed before the link monitor calls it lost.
+	s.run(1400, true, true, false, true, false, false);
+	EXPECT_EQ(s.machine.attempts(), 0u);
+	EXPECT_FALSE(s.saw(kelo::RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED));
+	EXPECT_NE(s.machine.state(), kelo::WHEEL_NORMAL_OPERATION);
+	s.run(3000, true, true, false, true, true);
+	EXPECT_EQ(s.machine.attempts(), 0u);
+}
+
+TEST(WheelRecoveryMachine, aLinkLossDuringSafeTorqueOffIsWaitedForAndReturnsToIt) {
+	Scenario s;
+	s.run(100, true, false);
+	s.run(500, true, true, false, true, true);
+	s.run(2500, false, true, false, true, false, false);
+	EXPECT_EQ(s.machine.state(), kelo::WHEEL_LINK_LOST);
+	s.run(4000, true, true, false, true, true);
+	EXPECT_FALSE(s.machine.failed());
+	EXPECT_EQ(s.machine.attempts(), 0u);
+}
+
+TEST(WheelRecoveryMachine, aGlitchRightAfterSafeTorqueOffClearedStillWaitsOutTheLatch) {
+	PairScenario s;
+	s.run(100);
+	s.drive.open = true;
+	s.run(2000);
+	s.drive.open = false;
+	while (!s.saw(kelo::RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED))
+		s.run(s.nowMs + 1);
+	// One faulty-looking frame is shorter than the latch: no attempt.
+	s.machine.step({s.nowMs + 1, true, true, true, false, false, true});
+	s.nowMs += 1;
+	s.run(s.nowMs + 50);
+	EXPECT_EQ(s.machine.attempts(), 0u);
+}
+
+TEST(WheelRecoveryMachine, safeTorqueOffNeverRevivesAFailedWheel) {
+	Scenario s;
+	s.run(3000, true, true, false);
+	ASSERT_TRUE(s.machine.failed());
+	const auto out = s.run(4000, true, true, false, true, true);
+	EXPECT_TRUE(s.machine.failed());
+	EXPECT_FALSE(out.allowsEnable);
+}
 
 TEST(WheelStatusSane, acceptsTheValuesSeenOnAHealthyOrReturningDrive) {
 	EXPECT_TRUE(kelo::wheelStatusSane(63, 2051));
