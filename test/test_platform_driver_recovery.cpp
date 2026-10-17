@@ -279,6 +279,27 @@ TEST_F(PlatformDriverRecovery, anEmergencyStopWhileDrivingHoldsTheDriverInsteadO
 	EXPECT_GT(speed(0), 0.1f) << "a command after a zero one drives";
 }
 
+TEST_F(PlatformDriverRecovery, theWheelsNeverReplayThePlatformRampAfterTheEmergencyStop) {
+	startDriving();
+	// 2.5 m/s^2: the platform ramp needs about 120 ms from 0.3 m/s to rest.
+	driver->setMaxvlindec(0.0025);
+	for (int w = 0; w < kWheels; w++)
+		bus.openPair(w);
+	ASSERT_TRUE(run(1000));
+	for (int w = 0; w < kWheels; w++)
+		bus.closePair(w);
+	ASSERT_TRUE(run(500));
+
+	commandVx = 0.0;
+	float peak = 0.0f;
+	for (int i = 0; i < 300; i++) {
+		ASSERT_TRUE(cycle());
+		for (int w = 0; w < kWheels; w++)
+			peak = std::max(peak, speed(w));
+	}
+	EXPECT_FLOAT_EQ(peak, 0.0f) << "the ramp ran down behind the hold; the wheels must not follow its tail";
+}
+
 TEST_F(PlatformDriverRecovery, aCommandTimeoutAfterTheEmergencyStopCountsAsTheZeroCommand) {
 	startDriving();
 	for (int w = 0; w < kWheels; w++)

@@ -117,8 +117,11 @@ TEST(WheelRecoveryMachine, aPairThatClosesDuringARetestIsRetestedOnceMoreWithout
 	s.run(100);
 	s.drive.open = true;
 	// The first retest starts a second after the pair opened; close inside it.
-	while (s.machine.state() != kelo::WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION)
+	const double deadlineMs = s.nowMs + 5000;
+	while (s.machine.state() != kelo::WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION && s.nowMs < deadlineMs)
 		s.run(s.nowMs + 1);
+	ASSERT_EQ(s.machine.state(), kelo::WHEEL_STATUS_RECOVERY_WAITIING_FOR_NORMAL_OPERATION)
+		<< "a pair that stays open is retested";
 	s.drive.open = false;
 	s.run(s.nowMs + 500);
 	EXPECT_FALSE(s.drive.latched);
@@ -213,6 +216,21 @@ TEST(WheelRecoveryMachine, aZeroedImageDuringSafeTorqueOffIsNotAClosedPair) {
 	EXPECT_EQ(s.machine.attempts(), 0u);
 }
 
+TEST(WheelRecoveryMachine, aZeroedImageNeverStartsARetest) {
+	Scenario s;
+	s.run(100, true, false);
+	s.run(300, true, true, false, true, true);
+	ASSERT_EQ(s.machine.state(), kelo::WHEEL_SAFE_TORQUE_OFF);
+	// Well inside the periodic retest's second: only a pair read closed could start one.
+	bool enabled = false;
+	while (s.nowMs < 800) {
+		s.nowMs += 1.0;
+		enabled |= s.machine.step({s.nowMs, true, true, true, false, false, false}).allowsEnable;
+	}
+	EXPECT_FALSE(enabled) << "a lost slave's zeroed image is not the pair closing";
+	EXPECT_EQ(s.machine.state(), kelo::WHEEL_SAFE_TORQUE_OFF);
+}
+
 TEST(WheelRecoveryMachine, aLinkLossDuringSafeTorqueOffIsWaitedForAndReturnsToIt) {
 	Scenario s;
 	s.run(100, true, false);
@@ -230,8 +248,10 @@ TEST(WheelRecoveryMachine, aGlitchRightAfterSafeTorqueOffClearedStillWaitsOutThe
 	s.drive.open = true;
 	s.run(2000);
 	s.drive.open = false;
-	while (!s.saw(kelo::RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED))
+	const double deadlineMs = s.nowMs + 5000;
+	while (!s.saw(kelo::RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED) && s.nowMs < deadlineMs)
 		s.run(s.nowMs + 1);
+	ASSERT_TRUE(s.saw(kelo::RECOVERY_EVENT_SAFE_TORQUE_OFF_CLEARED));
 	// One faulty-looking frame is shorter than the latch: no attempt.
 	s.machine.step({s.nowMs + 1, true, true, true, false, false, true});
 	s.nowMs += 1;
